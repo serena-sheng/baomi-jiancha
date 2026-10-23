@@ -114,23 +114,33 @@ final class Store {
 
     /// 本轮没见到的文件从索引里删掉；对应命中一起删
     func endSweep() {
-        lock.lock(); defer { lock.unlock() }
-        // 分批删，别在一个事务里攥着锁处理几十万行
+        // 分批处理，每批重新拿锁，避免几万行删到一半界面全冻住
         exec("CREATE TEMP TABLE IF NOT EXISTS gone(path TEXT PRIMARY KEY);")
         exec("DELETE FROM gone;")
+        lock.lock()
         exec("INSERT INTO gone(path) SELECT path FROM files WHERE path NOT IN (SELECT path FROM seen);")
+        lock.unlock()
+
+        exec("CREATE TEMP TABLE IF NOT EXISTS batch(path TEXT PRIMARY KEY);")
         while true {
-            exec("DELETE FROM findings WHERE path IN (SELECT path FROM gone LIMIT 5000);")
-            let changes = sqlite3_changes(db)
-            if changes == 0 { break }
+            lock.lock()
+            exec("DELETE FROM batch;")
+            exec("INSERT INTO batch SELECT path FROM gone LIMIT 2000;")
+            let any = sqlite3_changes(db) > 0
+            if !any {
+                exec("DELETE FROM gone;")
+                lock.unlock()
+                break
+            }
+            exec("DELETE FROM findings WHERE path IN (SELECT path FROM batch);")
+            exec("DELETE FROM files WHERE path IN (SELECT path FROM batch);")
+            exec("DELETE FROM gone WHERE path IN (SELECT path FROM batch);")
+            exec("DELETE FROM batch;")
+            lock.unlock()
         }
-        while true {
-            exec("DELETE FROM files WHERE path IN (SELECT path FROM gone LIMIT 5000);")
-            let changes = sqlite3_changes(db)
-            if changes == 0 { break }
-        }
-        exec("DELETE FROM gone;")
+        lock.lock()
         exec("DELETE FROM seen;")
+        lock.unlock()
     }
 
     // MARK: 命中
@@ -167,16 +177,26 @@ final class Store {
         var ctx: String
     }
 
-    func findings(limit: Int = 800) -> [Row] {
+    func findingsCount() -> Int {
+        lock.lock(); defer { lock.unlock() }
+        var st: OpaquePointer?
+        defer { sqlite3_finalize(st) }
+        guard sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM findings", -1, &st, nil) == SQLITE_OK,
+              sqlite3_step(st) == SQLITE_ROW else { return 0 }
+        return Int(sqlite3_column_int(st, 0))
+    }
+
+    func findings(limit: Int = 50, offset: Int = 0) -> [Row] {
         lock.lock(); defer { lock.unlock() }
         var out: [Row] = []
         var st: OpaquePointer?
         defer { sqlite3_finalize(st) }
         guard sqlite3_prepare_v2(db, """
         SELECT path,kind,level,place,value,note,ctx FROM findings
-        ORDER BY level DESC, found_at DESC LIMIT ?1
+        ORDER BY level DESC, found_at DESC LIMIT ?1 OFFSET ?2
         """, -1, &st, nil) == SQLITE_OK else { return out }
         sqlite3_bind_int(st, 1, Int32(limit))
+        sqlite3_bind_int(st, 2, Int32(offset))
         while sqlite3_step(st) == SQLITE_ROW {
             out.append(Row(path: text(st, 0), kind: text(st, 1), level: Int(sqlite3_column_int(st, 2)),
                            place: text(st, 3), value: text(st, 4), note: text(st, 5), ctx: text(st, 6)))

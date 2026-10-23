@@ -1284,10 +1284,10 @@ enum Declass {
     // MARK: OOXML
 
     /// 只改需要改的成员，其余原样复制；写完再复检
-    static func cleanOOXML(_ src: URL, to dst: URL) -> [String] {
+    static func cleanOOXML(_ src: URL, to dst: URL) -> (actions: [String], error: String?) {
         var actions: [String] = []
         let parts = Confidential.zipList(src.path)
-        guard !parts.isEmpty else { return ["打不开 zip"] }
+        guard !parts.isEmpty else { return ([], "打不开 zip") }
         let fm = FileManager.default
         let work = URL(fileURLWithPath: NSTemporaryDirectory() + "jingpan-declass-" + UUID().uuidString)
         try? fm.createDirectory(at: work, withIntermediateDirectories: true)
@@ -1295,7 +1295,7 @@ enum Declass {
 
         for part in parts {
             guard let data = Confidential.zipMemberData(src.path, part) else {
-                return ["读不出成员 \(part)，已中止"]
+                return ([], "读不出成员 \(part)，已中止")
             }
             var out = data
             var changed = false
@@ -1359,15 +1359,16 @@ enum Declass {
         z.arguments = ["-q", "-r", "-X", dst.path] + parts
         z.currentDirectoryURL = work
         z.standardError = FileHandle.nullDevice
-        do { try z.run() } catch { return ["打包失败"] }
+        do { try z.run() } catch { return (actions, "打包失败") }
         z.waitUntilExit()
-        guard z.terminationStatus == 0 else { return ["打包退出码 \(z.terminationStatus)"] }
-        // 成员集合必须和原件一致，少一个都不算成功
-        let after = Confidential.zipList(dst.path)
-        guard Set(after) == Set(parts) else {
-            return ["重打包后成员不一致（\(after.count)/\(parts.count)）"]
+        guard z.terminationStatus == 0 else { return (actions, "打包退出码 \(z.terminationStatus)") }
+        // 成员集合核对：被我们主动删掉的批注成员不算缺失
+        let removed = Set(parts.filter { $0.hasSuffix("comments.xml") })
+        let after = Set(Confidential.zipList(dst.path))
+        guard after == Set(parts).subtracting(removed), !after.isEmpty else {
+            return (actions, "重打包后成员不一致（\(after.count)/\(parts.count)）")
         }
-        return actions
+        return (actions, nil)
     }
 
     static func maskInXMLText(_ xml: String, open: String, close: String) -> String {
@@ -1548,14 +1549,11 @@ enum Declass {
     /// 调 LibreOffice 无头转换。沙盒化的 WPS 不能从外部驱动，所以用它。
     static func convert(_ src: URL, to target: String, outDir: URL) -> (URL?, String?) {
         guard let bin = libreOffice() else { return (nil, "没找到 LibreOffice，无法转换该格式") }
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: bin)
-        p.arguments = ["--headless", "--norestore", "--nolockcheck",
-                       "-env:UserInstallation=file:///tmp/jingpan-lo-profile",
-                       "--convert-to", target, "--outdir", outDir.path, src.path]
-        p.standardOutput = Pipe(); p.standardError = Pipe()
-        do { try p.run() } catch { return (nil, "无法启动 LibreOffice") }
-        p.waitUntilExit()
+        let r = Shell.run(bin, ["--headless", "--norestore", "--nolockcheck",
+                                "-env:UserInstallation=file:///tmp/jingpan-lo-profile",
+                                "--convert-to", target, "--outdir", outDir.path, src.path],
+                          timeout: 180)
+        if !r.ok { Log.w("convert: soffice 未成功 \(r.out.suffix(120))") }
         let expect = outDir.appendingPathComponent(src.deletingPathExtension().lastPathComponent)
             .appendingPathExtension(target)
         guard FileManager.default.fileExists(atPath: expect.path) else {
@@ -1646,7 +1644,9 @@ enum Declass {
             try? Data(cleanText(text).utf8).write(to: dst)
             actions = ["遮盖命中内容", "删除密级标志行"]
         case "docx", "xlsx", "pptx", "docm", "xlsm", "pptm":
-            actions = cleanOOXML(u, to: dst)
+            let r = cleanOOXML(u, to: dst)
+            if let err = r.error { return (r.actions, err) }
+            actions = r.actions
         case "jpg", "jpeg", "png", "heic", "tif", "tiff":
             actions = cleanImage(u, to: dst)
         case "pdf":
