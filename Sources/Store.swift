@@ -177,26 +177,30 @@ final class Store {
         var ctx: String
     }
 
-    func findingsCount() -> Int {
+    func findingsCount(minLevel: Int = 0) -> Int {
         lock.lock(); defer { lock.unlock() }
         var st: OpaquePointer?
         defer { sqlite3_finalize(st) }
-        guard sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM findings", -1, &st, nil) == SQLITE_OK,
+        guard sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM findings WHERE level >= ?1", -1, &st, nil) == SQLITE_OK else { return 0 }
+        sqlite3_bind_int(st, 1, Int32(minLevel))
+        guard
               sqlite3_step(st) == SQLITE_ROW else { return 0 }
         return Int(sqlite3_column_int(st, 0))
     }
 
-    func findings(limit: Int = 50, offset: Int = 0) -> [Row] {
+    func findings(limit: Int = 50, offset: Int = 0, minLevel: Int = 0) -> [Row] {
         lock.lock(); defer { lock.unlock() }
         var out: [Row] = []
         var st: OpaquePointer?
         defer { sqlite3_finalize(st) }
         guard sqlite3_prepare_v2(db, """
         SELECT path,kind,level,place,value,note,ctx FROM findings
+        WHERE level >= ?3
         ORDER BY level DESC, found_at DESC LIMIT ?1 OFFSET ?2
         """, -1, &st, nil) == SQLITE_OK else { return out }
         sqlite3_bind_int(st, 1, Int32(limit))
         sqlite3_bind_int(st, 2, Int32(offset))
+        sqlite3_bind_int(st, 3, Int32(minLevel))
         while sqlite3_step(st) == SQLITE_ROW {
             out.append(Row(path: text(st, 0), kind: text(st, 1), level: Int(sqlite3_column_int(st, 2)),
                            place: text(st, 3), value: text(st, 4), note: text(st, 5), ctx: text(st, 6)))

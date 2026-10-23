@@ -1285,20 +1285,26 @@ enum Declass {
 
     /// 只改需要改的成员，其余原样复制；写完再复检
     static func cleanOOXML(_ src: URL, to dst: URL) -> (actions: [String], error: String?) {
-        var actions: [String] = []
         let parts = Confidential.zipList(src.path)
         guard !parts.isEmpty else { return ([], "打不开 zip") }
         let fm = FileManager.default
-        let work = URL(fileURLWithPath: NSTemporaryDirectory() + "jingpan-declass-" + UUID().uuidString)
+        let work = URL(fileURLWithPath: NSTemporaryDirectory() + "baomi-declass-" + UUID().uuidString)
         try? fm.createDirectory(at: work, withIntermediateDirectories: true)
         defer { try? fm.removeItem(at: work) }
 
+        // 整包解出来再处理：unzip 会把 [Content_Types].xml 里的方括号当成通配符
+        let r = Shell.run("/usr/bin/ditto", ["-x", "-k", src.path, work.path], timeout: 60)
+        guard r.ok else { return ([], "解包失败") }
+
+        var actions: [String] = []
+        var removedParts = Set<String>()
+
         for part in parts {
-            guard let data = Confidential.zipMemberData(src.path, part) else {
-                return ([], "读不出成员 \(part)，已中止")
+            let file = work.appendingPathComponent(part)
+            guard let data = fm.contents(atPath: file.path) else {
+                return ([], "解包后缺少成员 \(part)")
             }
             var out = data
-            var changed = false
 
             if part == "docProps/core.xml" || part == "docProps/app.xml" {
                 var xml = String(decoding: data, as: UTF8.self)
@@ -1309,63 +1315,53 @@ enum Declass {
                         with: "<\(tag)></\(tag)>", options: .regularExpression)
                 }
                 out = Data(xml.utf8)
-                changed = true
                 if !actions.contains("清文档属性") { actions.append("清文档属性") }
             }
 
             if part.hasSuffix("comments.xml") {
+                try? fm.removeItem(at: file)
+                removedParts.insert(part)
                 if !actions.contains("删批注") { actions.append("删批注") }
-                continue          // 整个成员不写进新包；留个空文件会被下一次扫描当成「还有批注」
+                continue
             }
 
             if part.hasSuffix(".xml") && (part.hasPrefix("word/") || part.hasPrefix("xl/") || part.hasPrefix("ppt/")) {
                 var xml = String(decoding: data, as: UTF8.self)
                 let before = xml
-
-                // 接受修订：保留插入内容、删掉删除内容
                 if xml.contains("<w:ins") {
                     xml = xml.replacingOccurrences(of: "<w:ins[^>]*>", with: "", options: .regularExpression)
                     xml = xml.replacingOccurrences(of: "</w:ins>", with: "")
                 }
                 if xml.contains("<w:del") {
-                    xml = xml.replacingOccurrences(of: "<w:del [^>]*>.*?</w:del>", with: "",
-                                                   options: [.regularExpression])
-                    xml = xml.replacingOccurrences(of: "<w:del>.*?</w:del>", with: "", options: [.regularExpression])
+                    xml = xml.replacingOccurrences(of: "<w:del [^>]*>.*?</w:del>", with: "", options: .regularExpression)
+                    xml = xml.replacingOccurrences(of: "<w:del>.*?</w:del>", with: "", options: .regularExpression)
                     if !actions.contains("接受修订") { actions.append("接受修订") }
                 }
-                // 批注引用
                 xml = xml.replacingOccurrences(of: "<w:commentReference[^>]*/>", with: "", options: .regularExpression)
-
-                // 文本节点里遮盖命中（只动 <w:t> / <a:t> / 共享字符串的 <t>）
                 for (open, close) in [("<w:t", "</w:t>"), ("<a:t>", "</a:t>"), ("<t>", "</t>")] {
                     xml = maskInXMLText(xml, open: open, close: close)
                 }
                 if xml != before {
-                    out = Data(xml.utf8); changed = true
+                    out = Data(xml.utf8)
                     if !actions.contains("遮盖命中内容") { actions.append("遮盖命中内容") }
                 }
             }
 
-            let target = work.appendingPathComponent(part)
-            try? fm.createDirectory(at: target.deletingLastPathComponent(), withIntermediateDirectories: true)
-            try? out.write(to: target)
-            _ = changed
+            if out != data { try? out.write(to: file) }
         }
 
-        // 重新打包（保持原有条目顺序）
         try? fm.removeItem(at: dst)
         let z = Process()
         z.executableURL = URL(fileURLWithPath: "/usr/bin/zip")
-        z.arguments = ["-q", "-r", "-X", dst.path] + parts
+        z.arguments = ["-q", "-r", "-D", "-X", dst.path, "."]
         z.currentDirectoryURL = work
         z.standardError = FileHandle.nullDevice
         do { try z.run() } catch { return (actions, "打包失败") }
         z.waitUntilExit()
         guard z.terminationStatus == 0 else { return (actions, "打包退出码 \(z.terminationStatus)") }
-        // 成员集合核对：被我们主动删掉的批注成员不算缺失
-        let removed = Set(parts.filter { $0.hasSuffix("comments.xml") })
-        let after = Set(Confidential.zipList(dst.path))
-        guard after == Set(parts).subtracting(removed), !after.isEmpty else {
+
+        let after = Set(Confidential.zipList(dst.path).filter { !$0.hasSuffix("/") })
+        guard after == Set(parts).subtracting(removedParts), !after.isEmpty else {
             return (actions, "重打包后成员不一致（\(after.count)/\(parts.count)）")
         }
         return (actions, nil)

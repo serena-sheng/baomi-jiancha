@@ -17,7 +17,7 @@ func dyn(_ light: UInt32, _ dark: UInt32, _ a: CGFloat = 1) -> Color {
 enum T {
     static let ink    = dyn(0x1D1D1F, 0xF5F5F7)
     static let ink2   = dyn(0x5A5A61, 0xA6A6AD)
-    static let ink3   = dyn(0x67676F, 0x949499)
+    static let ink3   = dyn(0x67676F, 0xA0A0A6)   // 深色由 #949499 提到 4.6:1 以上
     static let hair   = dyn(0x000000, 0xFFFFFF, 0.08)
     static let track  = dyn(0x000000, 0xFFFFFF, 0.06)
     static let accent = dyn(0x0066CC, 0x0A84FF)
@@ -79,6 +79,8 @@ struct JPButton: View {
     var title: String
     var kind: JPKind = .ghost
     var enabled = true
+    /// 行内按钮：20pt 高，不把行撑高
+    var compact = false
     var action: () -> Void
     @State private var hover = false
 
@@ -105,7 +107,7 @@ struct JPButton: View {
                 .lineLimit(1)
                 .fixedSize()
                 .padding(.horizontal, kind == .ghost ? 0 : T.btnPadH)
-                .frame(minHeight: kind == .ghost ? T.ghostH : T.btnH)
+                .frame(minHeight: compact ? 20 : (kind == .ghost ? T.ghostH : T.btnH))
                 .background(
                     RoundedRectangle(cornerRadius: T.ctrl).fill(bg)
                         .overlay(
@@ -118,6 +120,7 @@ struct JPButton: View {
         .buttonStyle(.plain)
         .onHover { hover = $0 }
         .animation(.easeOut(duration: 0.12), value: hover)
+        .opacity(enabled ? 1 : 0.45)
         .allowsHitTesting(enabled)
     }
 }

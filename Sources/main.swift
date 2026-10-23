@@ -139,6 +139,7 @@ final class Scanner {
     private(set) var total = 0
     private(set) var lastFinish: Date?
     private(set) var lastStart: Date?
+    private(set) var lastHits = 0
     private(set) var needsFullDisk = false
     var onChange: (() -> Void)?
 
@@ -190,20 +191,22 @@ final class Scanner {
         let fm = FileManager.default
         needsFullDisk = !fm.isReadableFile(atPath: NSHomeDirectory() + "/Library/Mail")
 
-        // 先收文件清单：只收我们真要读的
+        // 边枚举边处理：不把两百万条 URL 攒在内存里，也就不需要总数
         var complete = true
+        var seen = 0
+        var hits = 0
         store.beginSweep()
-        var files: [URL] = []
+
         for root in Self.roots() {
-            guard !isStopped() else { break }
+            guard !isStopped() else { complete = false; break }
             guard let en = fm.enumerator(at: root,
                                          includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey, .contentModificationDateKey],
                                          options: [.skipsHiddenFiles, .skipsPackageDescendants]) else {
-                complete = false          // 某个根没走成，这一轮不能拿它做"幽灵清理"的依据
+                complete = false
                 continue
             }
             for case let u as URL in en {
-                if files.count >= Config.maxFiles || isStopped() {
+                if isStopped() || seen >= Config.maxFiles {
                     complete = false
                     break
                 }
@@ -212,49 +215,41 @@ final class Scanner {
                 if Config.excludeSuffixes.contains(where: { name.hasSuffix($0) }) {
                     en.skipDescendants(); continue
                 }
-                if (try? u.resourceValues(forKeys: [.isRegularFileKey]))?.isRegularFile == true {
-                    files.append(u)
-                    store.markSeen(u.path)
+                guard (try? u.resourceValues(forKeys: [.isRegularFileKey]))?.isRegularFile == true else { continue }
+                store.markSeen(u.path)
+                seen += 1
+                autoreleasepool {
+                    let before = store.counts().secret
+                    inspect(u)
+                    if store.counts().secret > before { hits += 1 }
                 }
-            }
-        }
-
-        DispatchQueue.main.async {
-            self.total = files.count
-            self.scanned = 0
-            self.onChange?()
-        }
-        Log.w("scan: 起点 \(files.count) 个文件")
-
-        for (i, u) in files.enumerated() {
-            if isStopped() { break }
-            autoreleasepool {
-                inspect(u)
-            }
-            if i % 40 == 0 {
-                let n = i
-                DispatchQueue.main.async {
-                    self.scanned = n
-                    self.onChange?()
+                if seen % 200 == 0 {
+                    let n = seen
+                    DispatchQueue.main.async {
+                        self.scanned = n
+                        self.total = 0          // 0 表示"还在清点，没有总数"
+                        self.onChange?()
+                    }
                 }
             }
         }
 
         if complete {
-            store.endSweep()          // 只有完整枚举过才删"这轮没见到"的记录
+            store.endSweep()
         } else {
             store.abandonSweep()
             Log.w("scan: 本轮未完整枚举（停止或触顶），保留原索引")
         }
         DispatchQueue.main.async {
             self.scanning = false
-            self.scanned = files.count
+            self.scanned = seen
             self.lastFinish = Date()
+            self.lastHits = hits
             self.onChange?()
         }
         let secs = Date().timeIntervalSince(started)
         Log.w(String(format: "scan: 完成 %d 个文件，%.1f 秒，命中 secret=%d internal=%d",
-                     files.count, secs,
+                     seen, secs,
                      store.counts().secret, store.counts().internalCount))
     }
 
@@ -309,6 +304,8 @@ final class Model: ObservableObject {
     @Published var processingTotal = 0
     @Published var undoable: Set<String> = []
     @Published var truncated = false
+    @Published var onlySecrets = false
+    @Published var scanSummary = ""
     @Published var processed: [ProcessedItem] = []
     @Published var page = 0
     @Published var pageSize = 50
@@ -346,6 +343,12 @@ struct JPCheck: View {
         .buttonStyle(.plain)
         .accessibilityLabel(on ? "取消选择" : "选择")
     }
+}
+
+func num(_ n: Int) -> String {
+    let f = NumberFormatter()
+    f.numberStyle = .decimal
+    return f.string(from: NSNumber(value: n)) ?? "\(n)"
 }
 
 struct RowView: View {
@@ -393,9 +396,9 @@ struct RowView: View {
                             .foregroundStyle(status.hasPrefix("没成功") ? T.warn : T.ink3)
                             .lineLimit(1)
                         if canUndo {
-                            JPButton(title: "撤销", kind: .ghost, action: onUndo)
+                            JPButton(title: "撤销", kind: .ghost, compact: true, action: onUndo)
                         } else if canRetry {
-                            JPButton(title: "重试", kind: .ghost, action: onRetry)
+                            JPButton(title: "重试", kind: .ghost, compact: true, action: onRetry)
                         }
                     } else {
                         if hovering {
@@ -409,7 +412,8 @@ struct RowView: View {
                             .buttonStyle(.plain)
                             .help("在访达中显示")
                         }
-                        JPButton(title: "脱密", kind: .ghost, enabled: !disabled, action: onProcess)
+                        JPButton(title: "脱密", kind: .ghost, enabled: !disabled,
+                                 compact: true, action: onProcess)
                     }
                 }
                 if !row.ctx.isEmpty {
@@ -428,8 +432,18 @@ struct RowView: View {
                     .padding(.leading, 44)
             }
         }
-        .padding(.horizontal, T.padH)
-        .padding(.vertical, 10)
+        .padding(.leading, selected ? T.padH - 6 : T.padH)
+        .padding(.trailing, T.padH)
+        .padding(.vertical, 9)
+        .overlay(alignment: .leading) {
+            if selected {
+                RoundedRectangle(cornerRadius: 1)
+                    .fill(T.accent)
+                    .frame(width: 2)
+                    .padding(.vertical, 6)
+                    .padding(.leading, 4)
+            }
+        }
         .onHover { hovering = $0 }
         .accessibilityElement(children: .combine)
         .accessibilityLabel("\(level.label) \((row.path as NSString).lastPathComponent) \(row.kind)")
@@ -451,6 +465,7 @@ struct MainView: View {
     var onPage: (Int) -> Void
     var onSelectPage: () -> Void
     var onRetry: (String) -> Void
+    var onToggleFilter: () -> Void
     /// 离屏预览时不用 ScrollView（它渲染不出来）
     var preview = false
 
@@ -478,47 +493,60 @@ struct MainView: View {
 
     // MARK: 头部
 
+    private var statusLine: String {
+        if model.scanning {
+            return model.total == 0
+                ? "正在清点并检查 · 已处理 \(num(model.scanned)) 个文件"
+                : "正在扫描 \(num(model.scanned))/\(num(model.total))"
+        }
+        if model.files == 0 { return "还没扫过：首次扫描会读很多文件，请让它跑完" }
+        return "已索引 \(num(model.files)) 个文件 · 上次完成 \(model.lastFinish)"
+    }
+
     private var header: some View {
         VStack(alignment: .leading, spacing: 6) {
             Text("保密检查").font(.jpT).foregroundStyle(T.ink)
-            Text(statusLine)
-                .font(.jpC)
-                .foregroundStyle(T.ink2)
+            Text(statusLine).font(.jpC).foregroundStyle(T.ink2)
+
             if model.scanning {
-                JPBar(value: progress)
-                    .padding(.top, 2)
+                if model.total == 0 {
+                    JPBar(value: 0.28, tint: T.ink3).padding(.top, 2)
+                } else {
+                    JPBar(value: progress).padding(.top, 2)
+                }
+            } else if !model.scanSummary.isEmpty {
+                Text(model.scanSummary).font(.jpC).foregroundStyle(T.ink3)
             }
+
             HStack(alignment: .firstTextBaseline, spacing: 6) {
                 JPDot(color: model.secret > 0 ? T.warn : T.ink3).offset(y: -2)
-                Text("\(model.secret)").font(.jpT)
+                Text(num(model.secret)).font(.jpT)
                     .foregroundStyle(model.secret > 0 ? T.ink : T.ink3)
                 Text("个秘密标志").font(.jpC).foregroundStyle(T.ink2)
-                Text("· \(model.internalCount) 内部 · \(model.info) 提示 · 共 \(model.totalHits) 条命中")
+                Text("· \(num(model.internalCount)) 内部 · \(num(model.info)) 提示 · 共 \(num(model.totalHits)) 条命中")
                     .font(.jpC).foregroundStyle(T.ink3)
-                    .padding(.leading, 4)
-                if model.scanning && !model.rows.isEmpty {
-                Text("扫描中 · 清单先不更新，新命中结束后一起显示")
-                    .font(.jpC).foregroundStyle(T.ink3)
-                    .padding(.top, 2)
-            }
-            if model.needsFullDisk {
+                if model.needsFullDisk {
                     Text("（不完整）").font(.jpC).foregroundStyle(T.warn)
+                }
+                Spacer(minLength: 8)
+                if model.pageCount > 1 {
+                    pager
                 }
             }
             .padding(.top, 2)
+
             if model.scanning && !model.rows.isEmpty {
                 Text("扫描中 · 清单先不更新，新命中结束后一起显示")
                     .font(.jpC).foregroundStyle(T.ink3)
                     .padding(.top, 2)
             }
+
             if model.needsFullDisk {
                 HStack(spacing: T.gap) {
                     JPDot(color: T.warn)
                     Text("没有「完全磁盘访问」权限，部分目录没查").font(.jpB).foregroundStyle(T.ink)
                     Button("去授权", action: onOpenSettings)
-                        .buttonStyle(.plain)
-                        .font(.jpM)
-                        .foregroundStyle(T.accent)
+                        .buttonStyle(.plain).font(.jpM).foregroundStyle(T.accent)
                 }
                 .padding(.top, 2)
             }
@@ -529,13 +557,30 @@ struct MainView: View {
         .padding(.bottom, 12)
     }
 
-    private var statusLine: String {
-        if model.scanning {
-            if model.total == 0 { return "正在清点文件，先不显示进度" }
-            return "正在扫描 \(model.scanned)/\(model.total)"
+    private var pager: some View {
+        HStack(spacing: 4) {
+            Button(action: { onPage(-1) }) {
+                Image(systemName: "chevron.left")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(model.page > 0 ? T.ink2 : T.ink3)
+                    .frame(width: 18, height: 18)
+            }
+            .buttonStyle(.plain)
+            .disabled(model.page == 0 || model.scanning)
+
+            Text("\(model.page + 1)/\(model.pageCount)")
+                .font(.jpC).foregroundStyle(T.ink2)
+                .fixedSize()
+
+            Button(action: { onPage(1) }) {
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(model.page + 1 < model.pageCount ? T.ink2 : T.ink3)
+                    .frame(width: 18, height: 18)
+            }
+            .buttonStyle(.plain)
+            .disabled(model.page + 1 >= model.pageCount || model.scanning)
         }
-        if model.files == 0 { return "还没扫过：首次扫描会读很多文件，请让它跑完" }
-        return "已索引 \(model.files) 个文件 · 上次完成 \(model.lastFinish)"
     }
 
     private func count(label: String, value: Int, tint: Color) -> some View {
@@ -588,7 +633,7 @@ struct MainView: View {
         if model.rows.isEmpty {
             VStack(spacing: T.gap) {
                 Text(model.scanning ? "扫描中，命中会在结束后列出"
-                     : (model.files == 0 ? "还没扫过" : "已扫描 \(model.files) 个文件，没有需要处理的内容"))
+                     : (model.files == 0 ? "还没扫过" : "没有需要处理的内容"))
                     .font(.jpB).foregroundStyle(T.ink3)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -640,11 +685,19 @@ struct MainView: View {
                 JPButton(title: "开始扫描", kind: .ghost, action: onScan)
                     .keyboardShortcut("r", modifiers: .command)
             }
-            JPButton(title: "全选本页", kind: .ghost, enabled: !model.rows.isEmpty) { onSelectPage() }
-                .keyboardShortcut("a", modifiers: .command)
-            JPButton(title: "清空", kind: .ghost, enabled: !model.selected.isEmpty) { onSelectAll(false) }
+            JPButton(title: model.onlySecrets ? "只看秘密 ✓" : "只看秘密", kind: .ghost) { onToggleFilter() }
+            if !model.rows.isEmpty {
+                JPButton(title: "全选本页", kind: .ghost) { onSelectPage() }
+                    .keyboardShortcut("a", modifiers: .command)
+                JPButton(title: "清空", kind: .ghost, enabled: !model.selected.isEmpty) { onSelectAll(false) }
+            }
             Spacer(minLength: 8)
+
             if model.processing {
+                JPBar(value: model.processingTotal > 0
+                      ? Double(model.processingDone) / Double(model.processingTotal) : 0,
+                      tint: T.accent)
+                    .frame(width: 80)
                 Text("正在处理 \(model.processingDone)/\(model.processingTotal)")
                     .font(.jpC).foregroundStyle(T.ink2)
                 JPButton(title: "中止", kind: .ghost, action: onStopProcessing)
@@ -652,28 +705,6 @@ struct MainView: View {
                 Text("已选 \(model.selected.count) 个").font(.jpC).foregroundStyle(T.ink3)
                 JPButton(title: "脱密选中 \(model.selected.count) 个", kind: .primary) {
                     onProcess(Array(model.selected))
-                }
-            }
-            if model.pageCount > 1 && !model.processing {
-                HStack(spacing: 4) {
-                    Button(action: { onPage(-1) }) {
-                        Image(systemName: "chevron.left")
-                            .font(.system(size: 10, weight: .semibold))
-                            .foregroundStyle(model.page > 0 ? T.ink2 : T.ink3)
-                            .frame(width: 20, height: 20)
-                    }
-                    .buttonStyle(.plain)
-                    .disabled(model.page == 0 || model.scanning)
-                    Text("\(model.page + 1)/\(model.pageCount)")
-                        .font(.jpC).foregroundStyle(T.ink2)
-                    Button(action: { onPage(1) }) {
-                        Image(systemName: "chevron.right")
-                            .font(.system(size: 10, weight: .semibold))
-                            .foregroundStyle(model.page + 1 < model.pageCount ? T.ink2 : T.ink3)
-                            .frame(width: 20, height: 20)
-                    }
-                    .buttonStyle(.plain)
-                    .disabled(model.page + 1 >= model.pageCount || model.scanning)
                 }
             }
             JPButton(title: "回收目录", kind: .ghost, action: onOpenTrash)
@@ -698,6 +729,7 @@ final class WindowController {
     var onPage: ((Int) -> Void)?
     var onSelectPage: (() -> Void)?
     var onRetry: ((String) -> Void)?
+    var onToggleFilter: (() -> Void)?
 
     init(model: Model, scanner: Scanner, store: Store) {
         self.model = model
@@ -727,7 +759,8 @@ final class WindowController {
                                 onStopProcessing: { [weak self] in self?.onStopProcessing?() },
                                 onPage: { [weak self] d in self?.onPage?(d) },
                                 onSelectPage: { [weak self] in self?.onSelectPage?() },
-                                onRetry: { [weak self] p in self?.onRetry?(p) })
+                                onRetry: { [weak self] p in self?.onRetry?(p) },
+                                onToggleFilter: { [weak self] in self?.onToggleFilter?() })
             let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 600, height: 560),
                              styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
                              backing: .buffered, defer: false)
@@ -800,6 +833,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         windowCtl.onPage = { [weak self] d in self?.goPage(d) }
         windowCtl.onSelectPage = { [weak self] in self?.selectPage() }
         windowCtl.onRetry = { [weak self] p in self?.retry(p) }
+        windowCtl.onToggleFilter = { [weak self] in
+            guard let self else { return }
+            self.model.onlySecrets.toggle()
+            self.model.page = 0
+            self.refresh()
+        }
 
         scanner.onChange = { [weak self] in self?.refresh() }
         buildStatusItem()
@@ -910,11 +949,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let c = self.store.counts()
             let scanning = self.scanner.scanning
             // 扫描中列表不重排：只更新计数与进度，避免用户正在看的行被换走
-            let total = self.store.findingsCount()
+            let minLevel = self.model.onlySecrets ? SecretLevel.secret.rawValue : 0
+            let total = self.store.findingsCount(minLevel: minLevel)
             let page = min(self.model.page, max(0, Int(ceil(Double(total) / Double(self.model.pageSize))) - 1))
             let rows = scanning ? self.model.rows
                                 : self.store.findings(limit: self.model.pageSize,
-                                                      offset: page * self.model.pageSize)
+                                                      offset: page * self.model.pageSize,
+                                                      minLevel: minLevel)
             DispatchQueue.main.async {
                 self.model.page = page
                 self.model.totalHits = total
@@ -925,6 +966,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private var lastScanRefresh = Date.distantPast
+    private var lastWasScanning = false
 
     private func apply(c: (secret: Int, internalCount: Int, info: Int, files: Int), rows: [Store.Row]) {
         model.secret = c.secret
@@ -932,6 +974,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         model.info = c.info
         model.files = c.files
         model.scanning = scanner.scanning
+        if !scanner.scanning, let _ = scanner.lastFinish, lastWasScanning {
+            model.scanSummary = scanner.lastHits > 0
+                ? "扫描完成 · 新增 \(scanner.lastHits) 个文件命中"
+                : "扫描完成 · 没有新增命中"
+        }
+        lastWasScanning = scanner.scanning
         model.scanned = scanner.scanned
         model.total = scanner.total
         model.needsFullDisk = scanner.needsFullDisk
@@ -1381,6 +1429,7 @@ if args.first == "--preview" {
                                     onSelectAll: { _ in }, onOpenTrash: {},
                                     onUndo: { _ in }, onStopProcessing: {},
                                     onPage: { _ in }, onSelectPage: {}, onRetry: { _ in },
+                                    onToggleFilter: {},
                                     preview: true)
                     .frame(width: 600, height: 560)
                     .environment(\.colorScheme, scheme)
