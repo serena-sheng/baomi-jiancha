@@ -4,6 +4,7 @@
 import Cocoa
 import SwiftUI
 import CoreServices
+import UserNotifications
 import IOKit
 
 // MARK: - 日志
@@ -23,11 +24,26 @@ enum Log {
     }
 }
 
+// MARK: - 通知
+
+enum Notifier {
+    static func post(title: String, body: String) {
+        let c = UNMutableNotificationContent()
+        c.title = title
+        c.body = body
+        c.sound = nil
+        if #available(macOS 12.0, *) { c.interruptionLevel = .passive }
+        let req = UNNotificationRequest(identifier: UUID().uuidString, content: c, trigger: nil)
+        UNUserNotificationCenter.current().add(req, withCompletionHandler: nil)
+    }
+}
+
 // MARK: - 配置
 
 enum Config {
     static let supportDir = NSHomeDirectory() + "/Library/Application Support/保密检查"
     static let dbPath = supportDir + "/index.db"
+    static let trashDir = supportDir + "/trash"
     static let appPath = "/Applications/保密检查.app"
     /// 不进去的地方：缓存、包、版本库、照片库、回收站
     static let excludeNames: Set<String> = [
@@ -244,14 +260,28 @@ final class Model: ObservableObject {
     @Published var total = 0
     @Published var lastFinish: String = "还没扫过"
     @Published var needsFullDisk = false
+    @Published var selected: Set<String> = []
+    @Published var processing = false
+    @Published var status: [String: String] = [:]
 }
 
 // MARK: - 界面
 
 struct RowView: View {
     var row: Store.Row
+    var selected: Bool
+    var status: String?
+    var disabled: Bool
+    var onToggle: () -> Void
+    var onProcess: () -> Void
+
     var body: some View {
         HStack(alignment: .top, spacing: 8) {
+            Toggle("", isOn: Binding(get: { selected }, set: { _ in onToggle() }))
+                .toggleStyle(.checkbox)
+                .labelsHidden()
+                .padding(.top, 1)
+                .disabled(disabled)
             Circle()
                 .fill(row.level >= SecretLevel.secret.rawValue ? Color.orange
                       : (row.level == SecretLevel.internalOnly.rawValue ? Color.secondary : Color.secondary.opacity(0.4)))
@@ -275,7 +305,18 @@ struct RowView: View {
                     .foregroundStyle(.tertiary).lineLimit(1)
                     .truncationMode(.middle)
             }
-            Spacer(minLength: 0)
+            Spacer(minLength: 8)
+            if let status {
+                Text(status)
+                    .font(.system(size: 12))
+                    .foregroundStyle(status.hasPrefix("失败") ? .orange : .secondary)
+                    .lineLimit(1)
+            } else {
+                Button("脱密", action: onProcess)
+                    .buttonStyle(.link)
+                    .font(.system(size: 12))
+                    .disabled(disabled)
+            }
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 8)
@@ -288,6 +329,10 @@ struct MainView: View {
     var onStop: () -> Void
     var onReveal: (String) -> Void
     var onOpenSettings: () -> Void
+    var onToggle: (String) -> Void
+    var onProcess: ([String]) -> Void
+    var onSelectAll: (Bool) -> Void
+    var onOpenTrash: () -> Void
 
     var body: some View {
         VStack(spacing: 0) {
@@ -327,7 +372,12 @@ struct MainView: View {
                 ScrollView {
                     LazyVStack(spacing: 0) {
                         ForEach(Array(model.rows.enumerated()), id: \.offset) { _, row in
-                            RowView(row: row)
+                            RowView(row: row,
+                                    selected: model.selected.contains(row.path),
+                                    status: model.status[row.path],
+                                    disabled: model.processing,
+                                    onToggle: { onToggle(row.path) },
+                                    onProcess: { onProcess([row.path]) })
                                 .contentShape(Rectangle())
                                 .onTapGesture { onReveal(row.path) }
                             Divider().padding(.leading, 32)
@@ -344,8 +394,20 @@ struct MainView: View {
                 } else {
                     Button("开始扫描", action: onScan)
                 }
+                Button("全选") { onSelectAll(true) }
+                    .disabled(model.rows.isEmpty)
+                Button("清空") { onSelectAll(false) }
+                    .disabled(model.selected.isEmpty)
                 Spacer()
-                Text("只读检查；不联网").font(.system(size: 11)).foregroundStyle(.tertiary)
+                if model.processing {
+                    Text("正在处理…").font(.system(size: 12)).foregroundStyle(.secondary)
+                } else if !model.selected.isEmpty {
+                    Button("脱密选中 \(model.selected.count) 个") { onProcess(Array(model.selected)) }
+                }
+                Button("回收目录", action: onOpenTrash)
+                    .buttonStyle(.link)
+                    .font(.system(size: 12))
+                Text("不联网").font(.system(size: 11)).foregroundStyle(.tertiary)
             }
             .padding(12)
         }
@@ -358,6 +420,11 @@ final class WindowController {
     private let model: Model
     private let scanner: Scanner
     private let store: Store
+
+    var onToggle: ((String) -> Void)?
+    var onProcess: (([String]) -> Void)?
+    var onSelectAll: ((Bool) -> Void)?
+    var onOpenTrash: (() -> Void)?
 
     init(model: Model, scanner: Scanner, store: Store) {
         self.model = model
@@ -378,7 +445,11 @@ final class WindowController {
                                     if let u = urls.compactMap(URL.init(string:)).first {
                                         NSWorkspace.shared.open(u)
                                     }
-                                })
+                                },
+                                onToggle: { [weak self] p in self?.onToggle?(p) },
+                                onProcess: { [weak self] paths in self?.onProcess?(paths) },
+                                onSelectAll: { [weak self] on in self?.onSelectAll?(on) },
+                                onOpenTrash: { [weak self] in self?.onOpenTrash?() })
             let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 560, height: 520),
                              styleMask: [.titled, .closable, .miniaturizable],
                              backing: .buffered, defer: false)
@@ -417,6 +488,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         store = Store(path: Config.dbPath)
         scanner = Scanner(store: store)
         windowCtl = WindowController(model: model, scanner: scanner, store: store)
+        windowCtl.onToggle = { [weak self] p in self?.toggleSelection(p) }
+        windowCtl.onProcess = { [weak self] paths in self?.declass(paths) }
+        windowCtl.onSelectAll = { [weak self] on in
+            guard let self else { return }
+            self.model.selected = on ? Set(self.model.rows.map(\.path)) : []
+        }
+        windowCtl.onOpenTrash = {
+            NSWorkspace.shared.open(URL(fileURLWithPath: Config.trashDir))
+        }
 
         scanner.onChange = { [weak self] in self?.refresh() }
         buildStatusItem()
@@ -579,6 +659,54 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    private func toggleSelection(_ path: String) {
+        if model.selected.contains(path) { model.selected.remove(path) }
+        else { model.selected.insert(path) }
+    }
+
+    /// 单条或批量：原件进回收目录，副本回原位，然后按复检结果更新清单
+    private func declass(_ paths: [String]) {
+        guard !paths.isEmpty, !model.processing else { return }
+        model.processing = true
+        model.status = [:]
+        Log.w("declass: 开始处理 \(paths.count) 个文件")
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            var ok = 0, bad = 0
+            for p in paths {
+                let url = URL(fileURLWithPath: p)
+                let out = Declass.apply(file: url, ocr: true,
+                                        trashDir: URL(fileURLWithPath: Config.trashDir))
+                DispatchQueue.main.async {
+                    self.model.status[p] = out.ok ? "已脱密" : "失败：\(out.error ?? "未知")"
+                }
+                if out.ok {
+                    ok += 1
+                    // 复检过了就按新文件重扫一遍，把这一行的命中更新掉
+                    let finalPath = out.newFile.map { url.deletingLastPathComponent().appendingPathComponent($0).path } ?? p
+                    var r = Confidential.Result()
+                    Confidential.inspectFileForCLI(URL(fileURLWithPath: finalPath), ocr: true, into: &r)
+                    self.store.replaceFindings(path: finalPath, with: r.findings)
+                    if finalPath != p { self.store.forget(p) }
+                } else {
+                    bad += 1
+                    Log.w("declass failed \(p): \(out.error ?? "-")")
+                }
+            }
+            DispatchQueue.main.async {
+                self.model.processing = false
+                self.model.selected = []
+                self.refresh()
+                Log.w("declass: 完成 ok=\(ok) failed=\(bad)")
+                Notifier.post(title: ok > 0 ? "已脱密 \(ok) 个文件" : "脱密没有完成",
+                              body: ok > 0
+                                ? "原件在回收目录，确认后请删除" + (bad > 0 ? "；\(bad) 个失败" : "")
+                                : "原件都没有改动")
+            }
+        }
+    }
+
     @objc private func showWindow() { windowCtl.show() }
     @objc private func scanNow() { scanner.start() }
     @objc private func stopNow() { scanner.stop() }
@@ -697,6 +825,31 @@ if args.first == "--scan", let target = args.dropFirst().first {
     }
     if args.contains("--json") { print(r.json) } else { print(r.text()) }
     exit(0)
+}
+
+// --process <路径>：走和界面同一条脱密管线（测试/批处理用）
+if args.first == "--process", let target = args.dropFirst().first {
+    let root = URL(fileURLWithPath: target)
+    let conf = Confidential.scan(root: root, ocr: true)
+    var files: [String] = []
+    for f in conf.findings where f.kind != .unscannable {
+        if !files.contains(f.file) { files.append(f.file) }
+    }
+    var ok = 0, bad = 0
+    for rel in files {
+        let url = root.appendingPathComponent(rel)
+        let out = Declass.apply(file: url, ocr: true,
+                                trashDir: URL(fileURLWithPath: Config.trashDir))
+        if out.ok {
+            ok += 1
+            print("✓ \(rel)  \(out.actions.joined(separator: "、"))")
+        } else {
+            bad += 1
+            print("✗ \(rel)  \(out.error ?? "-")")
+        }
+    }
+    print("完成：\(ok) 个已脱密，\(bad) 个失败；原件在 \(Config.trashDir)")
+    exit(bad == 0 ? 0 : 1)
 }
 
 app.run()

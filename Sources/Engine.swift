@@ -1595,9 +1595,7 @@ enum Declass {
 
         var before = Confidential.Result()
         Confidential.inspectFileForCLI(u, ocr: ocr, into: &before)
-        let beforeCritical = before.findings.filter {
-            $0.level >= .internalOnly || $0.kind == .author || $0.kind == .exif
-        }
+        let beforeCritical = before.findings.filter { $0.kind != .unscannable }
         if beforeCritical.isEmpty { return ([], "该文件当前没有需要处理的内容") }
 
         var actions: [String] = []
@@ -1634,15 +1632,13 @@ enum Declass {
         return (actions, nil)
     }
 
-    /// 处理一个文件：先产出干净副本（必要时先转格式）→ 复检 → 原件进 trash → 副本就位
-    static func apply(file u: URL, root: URL, ocr: Bool) -> Outcome {
+    /// 处理一个文件：产出干净副本（必要时先转格式）→ 复检 → 原件进回收目录 → 副本回原位
+    static func apply(file u: URL, ocr: Bool, trashDir: URL) -> Outcome {
         var out = Outcome(file: u.lastPathComponent)
         let ext = u.pathExtension.lowercased()
-        let base = root.resolvingSymlinksInPath()
-        let real = u.resolvingSymlinksInPath()
-        let rel = real.path.hasPrefix(base.path + "/") ? String(real.path.dropFirst(base.path.count + 1)) : u.lastPathComponent
+        let dir = u.deletingLastPathComponent()
 
-        let work = URL(fileURLWithPath: NSTemporaryDirectory() + "jingpan-out-" + UUID().uuidString)
+        let work = URL(fileURLWithPath: NSTemporaryDirectory() + "baomi-out-" + UUID().uuidString)
         try? FileManager.default.createDirectory(at: work, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: work) }
 
@@ -1654,42 +1650,40 @@ enum Declass {
         }
         out.verified = true
 
-        // 原件先进 trash（保持相对路径），之后才判断目标名是否被占用
-        var finalName = cleanURL.lastPathComponent
-        let trashDir = root.appendingPathComponent("trash")
-        let trashTarget = trashDir.appendingPathComponent(rel)
-        try? FileManager.default.createDirectory(at: trashTarget.deletingLastPathComponent(),
-                                                 withIntermediateDirectories: true)
-        var finalTrash = trashTarget
-        if FileManager.default.fileExists(atPath: finalTrash.path) {
-            finalTrash = trashTarget.deletingPathExtension()
-                .appendingPathExtension("\(Int(Date().timeIntervalSince1970))." + ext)
+        // 原件先移走，再放副本：中途失败还能回滚
+        try? FileManager.default.createDirectory(at: trashDir, withIntermediateDirectories: true)
+        var target = trashDir.appendingPathComponent(u.lastPathComponent)
+        if FileManager.default.fileExists(atPath: target.path) {
+            let stamp = Int(Date().timeIntervalSince1970)
+            target = trashDir.appendingPathComponent(
+                u.deletingPathExtension().lastPathComponent + "-\(stamp)." + ext)
         }
         do {
-            try FileManager.default.moveItem(at: u, to: finalTrash)
-            out.trashedTo = "trash/" + rel
+            try FileManager.default.moveItem(at: u, to: target)
+            out.trashedTo = target.path
         } catch {
-            out.error = "原件移入 trash 失败：\(error.localizedDescription)"
+            out.error = "原件移入回收目录失败：\(error.localizedDescription)"
             return out
         }
-        var finalURL = root.appendingPathComponent(finalName)
-        if FileManager.default.fileExists(atPath: finalURL.path) {
-            let stem = cleanURL.deletingPathExtension().lastPathComponent
-            finalName = stem + " (脱密)." + cleanURL.pathExtension
-            finalURL = root.appendingPathComponent(finalName)
+
+        var finalURL = u
+        if cleanURL.lastPathComponent != u.lastPathComponent {
+            finalURL = dir.appendingPathComponent(cleanURL.lastPathComponent)
+            if FileManager.default.fileExists(atPath: finalURL.path) {
+                finalURL = dir.appendingPathComponent(
+                    cleanURL.deletingPathExtension().lastPathComponent + " (脱密)." + cleanURL.pathExtension)
+            }
+            out.newFile = finalURL.lastPathComponent
         }
         do {
             try FileManager.default.moveItem(at: cleanURL, to: finalURL)
         } catch {
-            try? FileManager.default.moveItem(at: finalTrash, to: u)
+            try? FileManager.default.moveItem(at: target, to: u)
             out.error = "副本就位失败，已回滚"
             return out
         }
-        if finalName != u.lastPathComponent {
-            out.actions.append("新文件名 \(finalName)")
-            out.newFile = finalName
-        }
         return out
     }
+
 }
 
