@@ -267,6 +267,36 @@ final class Model: ObservableObject {
 
 // MARK: - 界面
 
+/// 与净盘同源的勾选框：14pt 方框，选中时只填强调色 + 一个白色勾
+struct JPCheck: View {
+    var on: Bool
+    var enabled: Bool = true
+    var action: () -> Void
+
+    var body: some View {
+        Button(action: { if enabled { action() } }) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 4)
+                    .fill(on ? T.accent : .clear)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 4)
+                            .strokeBorder(on ? Color.clear : T.hair, lineWidth: 1)
+                    )
+                if on {
+                    Image(systemName: "checkmark")
+                        .font(.system(size: 9, weight: .bold))
+                        .foregroundStyle(.white)
+                }
+            }
+            .frame(width: 14, height: 14)
+            .opacity(enabled ? 1 : 0.4)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(on ? "取消选择" : "选择")
+    }
+}
+
 struct RowView: View {
     var row: Store.Row
     var selected: Bool
@@ -275,51 +305,56 @@ struct RowView: View {
     var onToggle: () -> Void
     var onProcess: () -> Void
 
+    private var level: SecretLevel { SecretLevel(rawValue: row.level) ?? .info }
+    private var isSecret: Bool { level.isStateSecret }
+
     var body: some View {
-        HStack(alignment: .top, spacing: 8) {
-            Toggle("", isOn: Binding(get: { selected }, set: { _ in onToggle() }))
-                .toggleStyle(.checkbox)
-                .labelsHidden()
-                .padding(.top, 1)
-                .disabled(disabled)
-            Circle()
-                .fill(row.level >= SecretLevel.secret.rawValue ? Color.orange
-                      : (row.level == SecretLevel.internalOnly.rawValue ? Color.secondary : Color.secondary.opacity(0.4)))
-                .frame(width: 6, height: 6).padding(.top, 6)
-            VStack(alignment: .leading, spacing: 2) {
-                HStack(spacing: 6) {
-                    Text(SecretLevel(rawValue: row.level)?.label ?? "提示")
-                        .font(.system(size: 12, weight: .semibold))
-                        .foregroundStyle(row.level >= SecretLevel.secret.rawValue ? .orange : .secondary)
+        HStack(alignment: .top, spacing: T.gap) {
+            JPCheck(on: selected, enabled: !disabled, action: onToggle)
+                .padding(.top, 3)
+
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    JPDot(color: isSecret ? T.warn : (level == .internalOnly ? T.ink2 : T.ink3))
+                        .offset(y: -1)
+                    Text(isSecret ? level.label : (level == .internalOnly ? "内部" : "提示"))
+                        .font(.jpC)
+                        .foregroundStyle(isSecret ? T.warn : T.ink3)
                     Text((row.path as NSString).lastPathComponent)
-                        .font(.system(size: 13, weight: .medium))
+                        .font(.jpB)
+                        .foregroundStyle(T.ink)
                         .lineLimit(1)
-                    Text(row.kind).font(.system(size: 12)).foregroundStyle(.secondary)
+                        .truncationMode(.middle)
+                    Text(row.kind)
+                        .font(.jpC)
+                        .foregroundStyle(T.ink3)
+                        .lineLimit(1)
+                    Spacer(minLength: 6)
+                    if let status {
+                        Text(status)
+                            .font(.jpC)
+                            .foregroundStyle(status.hasPrefix("失败") ? T.warn : T.ink3)
+                            .lineLimit(1)
+                    } else {
+                        JPButton(title: "脱密", kind: .ghost, enabled: !disabled, action: onProcess)
+                    }
                 }
                 if !row.ctx.isEmpty {
-                    Text(row.ctx).font(.system(size: 12))
-                        .foregroundStyle(.secondary).lineLimit(1)
+                    Text(row.ctx)
+                        .font(.jpB)
+                        .foregroundStyle(T.ink2)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
                 }
                 Text((row.path as NSString).deletingLastPathComponent)
-                    .font(.system(size: 11))
-                    .foregroundStyle(.tertiary).lineLimit(1)
+                    .font(.jpC)
+                    .foregroundStyle(T.ink3)
+                    .lineLimit(1)
                     .truncationMode(.middle)
             }
-            Spacer(minLength: 8)
-            if let status {
-                Text(status)
-                    .font(.system(size: 12))
-                    .foregroundStyle(status.hasPrefix("失败") ? .orange : .secondary)
-                    .lineLimit(1)
-            } else {
-                Button("脱密", action: onProcess)
-                    .buttonStyle(.link)
-                    .font(.system(size: 12))
-                    .disabled(disabled)
-            }
         }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 8)
+        .padding(.horizontal, T.padH)
+        .padding(.vertical, 10)
     }
 }
 
@@ -333,85 +368,131 @@ struct MainView: View {
     var onProcess: ([String]) -> Void
     var onSelectAll: (Bool) -> Void
     var onOpenTrash: () -> Void
+    /// 离屏预览时不用 ScrollView（它渲染不出来）
+    var preview = false
+
+    private var progress: Double {
+        model.total > 0 ? Double(model.scanned) / Double(model.total) : 0
+    }
 
     var body: some View {
         VStack(spacing: 0) {
-            VStack(alignment: .leading, spacing: 4) {
-                Text("保密检查").font(.system(size: 16, weight: .semibold))
-                Text(model.scanning
-                     ? "正在扫描 \(model.scanned)/\(model.total)"
-                     : "上次完成：\(model.lastFinish) · 已索引 \(model.files) 个文件")
-                    .font(.system(size: 12)).foregroundStyle(.secondary)
-                HStack(spacing: 10) {
-                    Text("秘密标志 \(model.secret)").foregroundStyle(model.secret > 0 ? .orange : .secondary)
-                    Text("内部 \(model.internalCount)")
-                    Text("提示 \(model.info)")
-                }
-                .font(.system(size: 12))
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(16)
-
-            if model.needsFullDisk {
-                HStack(spacing: 8) {
-                    Text("没有「完全磁盘访问」权限，部分目录没查")
-                        .font(.system(size: 12)).foregroundStyle(.orange)
-                    Spacer()
-                    Button("去授权", action: onOpenSettings).buttonStyle(.link)
-                }
-                .padding(.horizontal, 16).padding(.bottom, 10)
-            }
-
-            Divider()
-
-            if model.rows.isEmpty {
-                Text(model.scanning ? "扫描中，命中会实时出现在这里" : "没有发现需要处理的内容")
-                    .font(.system(size: 13)).foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, minHeight: 180)
-            } else {
-                ScrollView {
-                    LazyVStack(spacing: 0) {
-                        ForEach(Array(model.rows.enumerated()), id: \.offset) { _, row in
-                            RowView(row: row,
-                                    selected: model.selected.contains(row.path),
-                                    status: model.status[row.path],
-                                    disabled: model.processing,
-                                    onToggle: { onToggle(row.path) },
-                                    onProcess: { onProcess([row.path]) })
-                                .contentShape(Rectangle())
-                                .onTapGesture { onReveal(row.path) }
-                            Divider().padding(.leading, 32)
-                        }
-                    }
-                }
-                .frame(minHeight: 240)
-            }
-
-            Divider()
-            HStack(spacing: 12) {
-                if model.scanning {
-                    Button("停止", action: onStop)
-                } else {
-                    Button("开始扫描", action: onScan)
-                }
-                Button("全选") { onSelectAll(true) }
-                    .disabled(model.rows.isEmpty)
-                Button("清空") { onSelectAll(false) }
-                    .disabled(model.selected.isEmpty)
-                Spacer()
-                if model.processing {
-                    Text("正在处理…").font(.system(size: 12)).foregroundStyle(.secondary)
-                } else if !model.selected.isEmpty {
-                    Button("脱密选中 \(model.selected.count) 个") { onProcess(Array(model.selected)) }
-                }
-                Button("回收目录", action: onOpenTrash)
-                    .buttonStyle(.link)
-                    .font(.system(size: 12))
-                Text("不联网").font(.system(size: 11)).foregroundStyle(.tertiary)
-            }
-            .padding(12)
+            header
+            JPHairline()
+            content
+            JPHairline()
+            footer
         }
-        .frame(width: 560, height: 520)
+        .frame(width: 600, height: 560)
+        .background(.regularMaterial)
+    }
+
+    // MARK: 头部
+
+    private var header: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("保密检查").font(.jpT).foregroundStyle(T.ink)
+            Text(model.scanning
+                 ? "正在扫描 \(model.scanned)/\(model.total)"
+                 : "已索引 \(model.files) 个文件 · 上次完成 \(model.lastFinish)")
+                .font(.jpC)
+                .foregroundStyle(T.ink2)
+            if model.scanning {
+                JPBar(value: progress)
+                    .padding(.top, 2)
+            }
+            HStack(spacing: T.block) {
+                count(label: "秘密标志", value: model.secret, tint: model.secret > 0 ? T.warn : T.ink3)
+                count(label: "内部", value: model.internalCount, tint: T.ink3)
+                count(label: "提示", value: model.info, tint: T.ink3)
+            }
+            .padding(.top, 2)
+            if model.needsFullDisk {
+                HStack(spacing: T.gap) {
+                    JPDot(color: T.warn)
+                    Text("没有「完全磁盘访问」权限，部分目录没查").font(.jpC).foregroundStyle(T.ink2)
+                    Button("去授权", action: onOpenSettings)
+                        .buttonStyle(.plain)
+                        .font(.jpM)
+                        .foregroundStyle(T.accent)
+                }
+                .padding(.top, 2)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, T.padH)
+        .padding(.top, T.padTop)
+        .padding(.bottom, 12)
+    }
+
+    private func count(label: String, value: Int, tint: Color) -> some View {
+        HStack(spacing: 6) {
+            JPDot(color: tint)
+            Text(label).font(.jpC).foregroundStyle(T.ink2)
+            Text("\(value)").font(.jpC).foregroundStyle(T.ink)
+        }
+    }
+
+    // MARK: 列表
+
+    @ViewBuilder
+    private var content: some View {
+        if model.rows.isEmpty {
+            VStack(spacing: T.gap) {
+                JPDot(color: T.ink3)
+                Text(model.scanning ? "扫描中，命中会实时出现在这里" : "没有发现需要处理的内容")
+                    .font(.jpB).foregroundStyle(T.ink3)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else if preview {
+            rowsList
+        } else {
+            ScrollView { rowsList }
+        }
+    }
+
+    @ViewBuilder
+    private var rowsList: some View {
+        LazyVStack(spacing: 0) {
+            ForEach(Array(model.rows.enumerated()), id: \.offset) { _, row in
+                RowView(row: row,
+                        selected: model.selected.contains(row.path),
+                        status: model.status[row.path],
+                        disabled: model.processing,
+                        onToggle: { onToggle(row.path) },
+                        onProcess: { onProcess([row.path]) })
+                    .contentShape(Rectangle())
+                    .onTapGesture { onReveal(row.path) }
+                JPHairline()
+                    .padding(.leading, T.padH + 22)
+                    .padding(.trailing, T.padH)
+            }
+        }
+    }
+
+    // MARK: 底部
+
+    private var footer: some View {
+        HStack(spacing: T.block) {
+            if model.scanning {
+                JPButton(title: "停止", kind: .ghost, action: onStop)
+            } else {
+                JPButton(title: "开始扫描", kind: .ghost, action: onScan)
+            }
+            JPButton(title: "全选", kind: .ghost, enabled: !model.rows.isEmpty) { onSelectAll(true) }
+            JPButton(title: "清空", kind: .ghost, enabled: !model.selected.isEmpty) { onSelectAll(false) }
+            Spacer(minLength: 8)
+            if model.processing {
+                Text("正在处理…").font(.jpC).foregroundStyle(T.ink2)
+            } else if !model.selected.isEmpty {
+                JPButton(title: "脱密选中 \(model.selected.count) 个", kind: .primary) {
+                    onProcess(Array(model.selected))
+                }
+            }
+            JPButton(title: "回收目录", kind: .ghost, action: onOpenTrash)
+        }
+        .padding(.horizontal, T.padH)
+        .frame(height: 56)
     }
 }
 
@@ -450,10 +531,12 @@ final class WindowController {
                                 onProcess: { [weak self] paths in self?.onProcess?(paths) },
                                 onSelectAll: { [weak self] on in self?.onSelectAll?(on) },
                                 onOpenTrash: { [weak self] in self?.onOpenTrash?() })
-            let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 560, height: 520),
-                             styleMask: [.titled, .closable, .miniaturizable],
+            let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 600, height: 560),
+                             styleMask: [.titled, .closable, .miniaturizable, .fullSizeContentView],
                              backing: .buffered, defer: false)
             w.title = "保密检查"
+            w.titlebarAppearsTransparent = true
+            w.isMovableByWindowBackground = true
             w.contentView = NSHostingView(rootView: view)
             w.isReleasedWhenClosed = false
             w.center()
@@ -850,6 +933,58 @@ if args.first == "--process", let target = args.dropFirst().first {
     }
     print("完成：\(ok) 个已脱密，\(bad) 个失败；原件在 \(Config.trashDir)")
     exit(bad == 0 ? 0 : 1)
+}
+
+// --preview <目录>：离屏渲染主窗口，用于视觉核对（不读真实文件）
+if args.first == "--preview" {
+    let dir = args.dropFirst().first ?? "/tmp/baomi-preview"
+    try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+    app.setActivationPolicy(.accessory)
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+        let m = Model()
+        m.scanning = true
+        m.scanned = 25560
+        m.total = 91219
+        m.files = 25560
+        m.secret = 3
+        m.internalCount = 81
+        m.info = 37132
+        m.lastFinish = "10-23 21:40"
+        m.rows = [
+            .init(path: "/Users/serena/Desktop/绝密材料.txt", kind: "密级标志", level: 4,
+                  place: "正文", value: "绝密", note: "",
+                  ctx: "「绝密」★ 保密期限 30 年 本文件仅限内部传阅"),
+            .init(path: "/Users/serena/Desktop/扫描件-机密.pdf", kind: "密级标志", level: 3,
+                  place: "1 页·OCR", value: "机密", note: "",
+                  ctx: "「机密」★ 保密期限 10 年 关于第三季度经营情况的通报"),
+            .init(path: "/Users/serena/Desktop/报告.docx", kind: "修订痕迹", level: 1,
+                  place: "正文", value: "修订记录", note: "",
+                  ctx: "文档被改过 2 次，历史内容可能仍在"),
+            .init(path: "/Users/serena/Desktop/照片.jpg", kind: "照片位置", level: 0,
+                  place: "GPS", value: "拍摄位置", note: "",
+                  ctx: "照片会暴露拍摄地点"),
+        ]
+        m.selected = ["/Users/serena/Desktop/报告.docx"]
+        for scheme in [ColorScheme.light, .dark] {
+            let view = MainView(model: m, onScan: {}, onStop: {}, onReveal: { _ in },
+                                onOpenSettings: {}, onToggle: { _ in }, onProcess: { _ in },
+                                onSelectAll: { _ in }, onOpenTrash: {},
+                                preview: true)
+                .environment(\.colorScheme, scheme)
+            let r = ImageRenderer(content: view)
+            r.scale = 2
+            r.isOpaque = true
+            if let cg = r.cgImage {
+                let rep = NSBitmapImageRep(cgImage: cg)
+                let name = scheme == .dark ? "main-dark.png" : "main.png"
+                try? rep.representation(using: .png, properties: [:])?
+                    .write(to: URL(fileURLWithPath: dir + "/" + name))
+                print("wrote \(name) \(cg.width)x\(cg.height)")
+            }
+        }
+        exit(0)
+    }
+    app.run()
 }
 
 app.run()
