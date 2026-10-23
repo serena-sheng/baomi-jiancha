@@ -29,6 +29,7 @@ final class Store {
           value TEXT, note TEXT, ctx TEXT, via_ocr INTEGER, found_at REAL);
         """)
         exec("CREATE INDEX IF NOT EXISTS idx_find_level ON findings(level DESC, found_at DESC);")
+        exec("CREATE INDEX IF NOT EXISTS idx_find_path ON findings(path);")
         exec("CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);")
     }
 
@@ -105,11 +106,30 @@ final class Store {
         run("INSERT OR IGNORE INTO seen(path) VALUES(?1)", [path])
     }
 
+    /// 本轮不完整（停止/触顶）：只丢弃 seen，绝不动已有索引
+    func abandonSweep() {
+        lock.lock(); defer { lock.unlock() }
+        exec("DELETE FROM seen;")
+    }
+
     /// 本轮没见到的文件从索引里删掉；对应命中一起删
     func endSweep() {
         lock.lock(); defer { lock.unlock() }
-        exec("DELETE FROM files WHERE path NOT IN (SELECT path FROM seen);")
-        exec("DELETE FROM findings WHERE path NOT IN (SELECT path FROM files);")
+        // 分批删，别在一个事务里攥着锁处理几十万行
+        exec("CREATE TEMP TABLE IF NOT EXISTS gone(path TEXT PRIMARY KEY);")
+        exec("DELETE FROM gone;")
+        exec("INSERT INTO gone(path) SELECT path FROM files WHERE path NOT IN (SELECT path FROM seen);")
+        while true {
+            exec("DELETE FROM findings WHERE path IN (SELECT path FROM gone LIMIT 5000);")
+            let changes = sqlite3_changes(db)
+            if changes == 0 { break }
+        }
+        while true {
+            exec("DELETE FROM files WHERE path IN (SELECT path FROM gone LIMIT 5000);")
+            let changes = sqlite3_changes(db)
+            if changes == 0 { break }
+        }
+        exec("DELETE FROM gone;")
         exec("DELETE FROM seen;")
     }
 

@@ -17,20 +17,41 @@ enum Fmt {
 }
 
 enum Shell {
+    /// 外部命令一律带超时；stderr 直接丢掉，否则子进程写满管道会和我们互锁
     @discardableResult
-    static func run(_ path: String, _ args: [String], cwd: String? = nil) -> (out: String, ok: Bool) {
+    static func run(_ path: String, _ args: [String], cwd: String? = nil,
+                    timeout: TimeInterval = 15) -> (out: String, ok: Bool) {
         guard FileManager.default.isExecutableFile(atPath: path) else { return ("", false) }
         let p = Process()
         p.executableURL = URL(fileURLWithPath: path)
         p.arguments = args
         if let cwd { p.currentDirectoryURL = URL(fileURLWithPath: cwd) }
-        let pipe = Pipe()
-        p.standardOutput = pipe
-        p.standardError = Pipe()
+        let out = Pipe()
+        p.standardOutput = out
+        p.standardError = FileHandle.nullDevice
         do { try p.run() } catch { return ("", false) }
-        let d = pipe.fileHandleForReading.readDataToEndOfFile()
-        p.waitUntilExit()
-        return (String(decoding: d, as: UTF8.self), p.terminationStatus == 0)
+
+        var data = Data()
+        let readDone = DispatchSemaphore(value: 0)
+        DispatchQueue.global(qos: .utility).async {
+            data = out.fileHandleForReading.readDataToEndOfFile()
+            readDone.signal()
+        }
+        let waitDone = DispatchSemaphore(value: 0)
+        p.terminationHandler = { _ in waitDone.signal() }
+
+        if waitDone.wait(timeout: .now() + timeout) == .timedOut {
+            p.terminate()
+            if waitDone.wait(timeout: .now() + 2) == .timedOut {
+                kill(p.processIdentifier, SIGKILL)
+                _ = waitDone.wait(timeout: .now() + 2)
+            }
+            _ = readDone.wait(timeout: .now() + 2)
+            Log.w("shell: 超时 \(path) \(args.prefix(2).joined(separator: " "))")
+            return ("", false)
+        }
+        _ = readDone.wait(timeout: .now() + 2)
+        return (String(decoding: data, as: UTF8.self), p.terminationStatus == 0)
     }
 }
 
@@ -1177,6 +1198,16 @@ extension Confidential.Result {
 // MARK: - 脱密（产出干净副本，原件进 trash）
 
 enum Declass {
+    /// 跨卷 moveItem 会抛 EXDEV：先试 move，失败就 copy + remove
+    static func transfer(_ from: URL, _ to: URL) throws {
+        do {
+            try FileManager.default.moveItem(at: from, to: to)
+        } catch {
+            try FileManager.default.copyItem(at: from, to: to)
+            try FileManager.default.removeItem(at: from)
+        }
+    }
+
     struct Outcome {
         var file: String
         var newFile: String?
@@ -1263,7 +1294,9 @@ enum Declass {
         defer { try? fm.removeItem(at: work) }
 
         for part in parts {
-            guard let data = Confidential.zipMemberData(src.path, part) else { continue }
+            guard let data = Confidential.zipMemberData(src.path, part) else {
+                return ["读不出成员 \(part)，已中止"]
+            }
             var out = data
             var changed = false
 
@@ -1325,7 +1358,15 @@ enum Declass {
         z.executableURL = URL(fileURLWithPath: "/usr/bin/zip")
         z.arguments = ["-q", "-r", "-X", dst.path] + parts
         z.currentDirectoryURL = work
-        try? z.run(); z.waitUntilExit()
+        z.standardError = FileHandle.nullDevice
+        do { try z.run() } catch { return ["打包失败"] }
+        z.waitUntilExit()
+        guard z.terminationStatus == 0 else { return ["打包退出码 \(z.terminationStatus)"] }
+        // 成员集合必须和原件一致，少一个都不算成功
+        let after = Confidential.zipList(dst.path)
+        guard Set(after) == Set(parts) else {
+            return ["重打包后成员不一致（\(after.count)/\(parts.count)）"]
+        }
         return actions
     }
 
@@ -1659,7 +1700,7 @@ enum Declass {
                 u.deletingPathExtension().lastPathComponent + "-\(stamp)." + ext)
         }
         do {
-            try FileManager.default.moveItem(at: u, to: target)
+            try transfer(u, target)
             out.trashedTo = target.path
         } catch {
             out.error = "原件移入回收目录失败：\(error.localizedDescription)"
@@ -1676,10 +1717,15 @@ enum Declass {
             out.newFile = finalURL.lastPathComponent
         }
         do {
-            try FileManager.default.moveItem(at: cleanURL, to: finalURL)
+            try transfer(cleanURL, finalURL)
         } catch {
-            try? FileManager.default.moveItem(at: target, to: u)
-            out.error = "副本就位失败，已回滚"
+            // 回滚也要跨卷安全；回滚失败必须如实说
+            do {
+                try transfer(target, u)
+                out.error = "副本就位失败，已回滚（原件在原位）"
+            } catch {
+                out.error = "副本就位失败，原件在回收目录：\(target.path)"
+            }
             return out
         }
         return out

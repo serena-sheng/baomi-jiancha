@@ -161,15 +161,22 @@ final class Scanner {
         needsFullDisk = !fm.isReadableFile(atPath: NSHomeDirectory() + "/Library/Mail")
 
         // 先收文件清单：只收我们真要读的
+        var complete = true
         store.beginSweep()
         var files: [URL] = []
         for root in Self.roots() {
             guard !isStopped() else { break }
             guard let en = fm.enumerator(at: root,
                                          includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey, .contentModificationDateKey],
-                                         options: [.skipsHiddenFiles, .skipsPackageDescendants]) else { continue }
+                                         options: [.skipsHiddenFiles, .skipsPackageDescendants]) else {
+                complete = false          // 某个根没走成，这一轮不能拿它做"幽灵清理"的依据
+                continue
+            }
             for case let u as URL in en {
-                if files.count >= Config.maxFiles || isStopped() { break }
+                if files.count >= Config.maxFiles || isStopped() {
+                    complete = false
+                    break
+                }
                 let name = u.lastPathComponent
                 if Config.excludeNames.contains(name) { en.skipDescendants(); continue }
                 if Config.excludeSuffixes.contains(where: { name.hasSuffix($0) }) {
@@ -203,7 +210,12 @@ final class Scanner {
             }
         }
 
-        store.endSweep()
+        if complete {
+            store.endSweep()          // 只有完整枚举过才删"这轮没见到"的记录
+        } else {
+            store.abandonSweep()
+            Log.w("scan: 本轮未完整枚举（停止或触顶），保留原索引")
+        }
         DispatchQueue.main.async {
             self.scanning = false
             self.scanned = files.count
@@ -263,6 +275,10 @@ final class Model: ObservableObject {
     @Published var selected: Set<String> = []
     @Published var processing = false
     @Published var status: [String: String] = [:]
+    @Published var processingDone = 0
+    @Published var processingTotal = 0
+    @Published var undoable: Set<String> = []
+    @Published var truncated = false
 }
 
 // MARK: - 界面
@@ -302,8 +318,14 @@ struct RowView: View {
     var selected: Bool
     var status: String?
     var disabled: Bool
+    var canUndo: Bool
+    var canRetry: Bool
     var onToggle: () -> Void
     var onProcess: () -> Void
+    var onReveal: () -> Void
+    var onUndo: () -> Void
+    var onRetry: () -> Void
+    @State private var hovering = false
 
     private var level: SecretLevel { SecretLevel(rawValue: row.level) ?? .info }
     private var isSecret: Bool { level.isStateSecret }
@@ -333,9 +355,25 @@ struct RowView: View {
                     if let status {
                         Text(status)
                             .font(.jpC)
-                            .foregroundStyle(status.hasPrefix("失败") ? T.warn : T.ink3)
+                            .foregroundStyle(status.hasPrefix("没成功") ? T.warn : T.ink3)
                             .lineLimit(1)
+                        if canUndo {
+                            JPButton(title: "撤销", kind: .ghost, action: onUndo)
+                        } else if canRetry {
+                            JPButton(title: "重试", kind: .ghost, action: onRetry)
+                        }
                     } else {
+                        if hovering {
+                            Button(action: onReveal) {
+                                Image(systemName: "arrow.up.forward.app")
+                                    .font(.system(size: 11, weight: .semibold))
+                                    .foregroundStyle(T.ink3)
+                                    .frame(width: 20, height: 20)
+                                    .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                            .help("在访达中显示")
+                        }
                         JPButton(title: "脱密", kind: .ghost, enabled: !disabled, action: onProcess)
                     }
                 }
@@ -355,6 +393,9 @@ struct RowView: View {
         }
         .padding(.horizontal, T.padH)
         .padding(.vertical, 10)
+        .onHover { hovering = $0 }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(level.label) \((row.path as NSString).lastPathComponent) \(row.kind)")
     }
 }
 
@@ -368,6 +409,8 @@ struct MainView: View {
     var onProcess: ([String]) -> Void
     var onSelectAll: (Bool) -> Void
     var onOpenTrash: () -> Void
+    var onUndo: (String) -> Void
+    var onStopProcessing: () -> Void
     /// 离屏预览时不用 ScrollView（它渲染不出来）
     var preview = false
 
@@ -380,11 +423,13 @@ struct MainView: View {
             header
             JPHairline()
             content
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
             JPHairline()
             footer
         }
-        .frame(width: 600, height: 560)
-        .background(.regularMaterial)
+        .frame(minWidth: 520, minHeight: 420)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Color(nsColor: .windowBackgroundColor))
     }
 
     // MARK: 头部
@@ -392,9 +437,7 @@ struct MainView: View {
     private var header: some View {
         VStack(alignment: .leading, spacing: 6) {
             Text("保密检查").font(.jpT).foregroundStyle(T.ink)
-            Text(model.scanning
-                 ? "正在扫描 \(model.scanned)/\(model.total)"
-                 : "已索引 \(model.files) 个文件 · 上次完成 \(model.lastFinish)")
+            Text(statusLine)
                 .font(.jpC)
                 .foregroundStyle(T.ink2)
             if model.scanning {
@@ -425,6 +468,15 @@ struct MainView: View {
         .padding(.bottom, 12)
     }
 
+    private var statusLine: String {
+        if model.scanning {
+            if model.total == 0 { return "正在清点文件，先不显示进度" }
+            return "正在扫描 \(model.scanned)/\(model.total)"
+        }
+        if model.files == 0 { return "还没扫过：首次扫描会读很多文件，请让它跑完" }
+        return "已索引 \(model.files) 个文件 · 上次完成 \(model.lastFinish)"
+    }
+
     private func count(label: String, value: Int, tint: Color) -> some View {
         HStack(spacing: 6) {
             JPDot(color: tint)
@@ -440,14 +492,22 @@ struct MainView: View {
         if model.rows.isEmpty {
             VStack(spacing: T.gap) {
                 JPDot(color: T.ink3)
-                Text(model.scanning ? "扫描中，命中会实时出现在这里" : "没有发现需要处理的内容")
+                Text(model.scanning ? "扫描中，命中会在结束后列出"
+                     : (model.files == 0 ? "还没扫过" : "已扫描 \(model.files) 个文件，没有需要处理的内容"))
                     .font(.jpB).foregroundStyle(T.ink3)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
-        } else if preview {
-            rowsList
         } else {
-            ScrollView { rowsList }
+            VStack(spacing: 0) {
+                if preview { rowsList } else { ScrollView { rowsList } }
+                if model.truncated {
+                    Text("只列出前 800 条；全选也只作用于这 800 条")
+                        .font(.jpC).foregroundStyle(T.ink3)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, T.padH)
+                        .padding(.vertical, 6)
+                }
+            }
         }
     }
 
@@ -459,10 +519,15 @@ struct MainView: View {
                         selected: model.selected.contains(row.path),
                         status: model.status[row.path],
                         disabled: model.processing,
+                        canUndo: model.undoable.contains(row.path),
+                        canRetry: model.status[row.path]?.hasPrefix("没成功") == true,
                         onToggle: { onToggle(row.path) },
-                        onProcess: { onProcess([row.path]) })
+                        onProcess: { onProcess([row.path]) },
+                        onReveal: { onReveal(row.path) },
+                        onUndo: { onUndo(row.path) },
+                        onRetry: { onProcess([row.path]) })
                     .contentShape(Rectangle())
-                    .onTapGesture { onReveal(row.path) }
+                    .onTapGesture { onToggle(row.path) }
                 JPHairline()
                     .padding(.leading, T.padH + 22)
                     .padding(.trailing, T.padH)
@@ -478,12 +543,16 @@ struct MainView: View {
                 JPButton(title: "停止", kind: .ghost, action: onStop)
             } else {
                 JPButton(title: "开始扫描", kind: .ghost, action: onScan)
+                    .keyboardShortcut("r", modifiers: .command)
             }
             JPButton(title: "全选", kind: .ghost, enabled: !model.rows.isEmpty) { onSelectAll(true) }
+                .keyboardShortcut("a", modifiers: .command)
             JPButton(title: "清空", kind: .ghost, enabled: !model.selected.isEmpty) { onSelectAll(false) }
             Spacer(minLength: 8)
             if model.processing {
-                Text("正在处理…").font(.jpC).foregroundStyle(T.ink2)
+                Text("正在处理 \(model.processingDone)/\(model.processingTotal)")
+                    .font(.jpC).foregroundStyle(T.ink2)
+                JPButton(title: "中止", kind: .ghost, action: onStopProcessing)
             } else if !model.selected.isEmpty {
                 JPButton(title: "脱密选中 \(model.selected.count) 个", kind: .primary) {
                     onProcess(Array(model.selected))
@@ -506,6 +575,8 @@ final class WindowController {
     var onProcess: (([String]) -> Void)?
     var onSelectAll: ((Bool) -> Void)?
     var onOpenTrash: (() -> Void)?
+    var onUndo: ((String) -> Void)?
+    var onStopProcessing: (() -> Void)?
 
     init(model: Model, scanner: Scanner, store: Store) {
         self.model = model
@@ -530,13 +601,18 @@ final class WindowController {
                                 onToggle: { [weak self] p in self?.onToggle?(p) },
                                 onProcess: { [weak self] paths in self?.onProcess?(paths) },
                                 onSelectAll: { [weak self] on in self?.onSelectAll?(on) },
-                                onOpenTrash: { [weak self] in self?.onOpenTrash?() })
+                                onOpenTrash: { [weak self] in self?.onOpenTrash?() },
+                                onUndo: { [weak self] p in self?.onUndo?(p) },
+                                onStopProcessing: { [weak self] in self?.onStopProcessing?() })
             let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 600, height: 560),
-                             styleMask: [.titled, .closable, .miniaturizable, .fullSizeContentView],
+                             styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
                              backing: .buffered, defer: false)
             w.title = "保密检查"
+            w.titleVisibility = .hidden
             w.titlebarAppearsTransparent = true
             w.isMovableByWindowBackground = true
+            w.minSize = NSSize(width: 520, height: 420)
+            w.setFrameAutosaveName("BaomiMain")
             w.contentView = NSHostingView(rootView: view)
             w.isReleasedWhenClosed = false
             w.center()
@@ -568,6 +644,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ n: Notification) {
         Log.w("app: 启动，roots=\(Scanner.roots().map(\.path).joined(separator: ","))")
         NSApp.setActivationPolicy(.accessory)
+        let main = NSMenu()
+        let appItem = NSMenuItem()
+        main.addItem(appItem)
+        let appMenu = NSMenu()
+        appMenu.addItem(NSMenuItem(title: "退出 保密检查",
+                                   action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
+        appItem.submenu = appMenu
+        let winItem = NSMenuItem()
+        main.addItem(winItem)
+        let winMenu = NSMenu(title: "窗口")
+        winMenu.addItem(NSMenuItem(title: "关闭", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w"))
+        winMenu.addItem(NSMenuItem(title: "最小化", action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m"))
+        winItem.submenu = winMenu
+        NSApp.mainMenu = main
         store = Store(path: Config.dbPath)
         scanner = Scanner(store: store)
         windowCtl = WindowController(model: model, scanner: scanner, store: store)
@@ -580,6 +670,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         windowCtl.onOpenTrash = {
             NSWorkspace.shared.open(URL(fileURLWithPath: Config.trashDir))
         }
+        windowCtl.onUndo = { [weak self] p in self?.undo(p) }
+        windowCtl.onStopProcessing = { [weak self] in self?.cancelProcessing = true }
 
         scanner.onChange = { [weak self] in self?.refresh() }
         buildStatusItem()
@@ -678,8 +770,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.menu = menu
     }
 
+    private let readQueue = DispatchQueue(label: "baomi.read", qos: .utility)
+    private var refreshing = false
+
+    /// 读库放在后台串行队列：endSweep 删两百万行时，主线程不能跟着等锁
     private func refresh() {
-        let c = store.counts()
+        if refreshing { return }
+        refreshing = true
+        readQueue.async { [weak self] in
+            guard let self else { return }
+            let c = self.store.counts()
+            let scanning = self.scanner.scanning
+            // 扫描中列表不重排：只更新计数与进度，避免用户正在看的行被换走
+            let rows = scanning ? self.model.rows : self.store.findings()
+            DispatchQueue.main.async {
+                self.apply(c: c, rows: rows)
+                self.refreshing = false
+            }
+        }
+    }
+
+    private var lastScanRefresh = Date.distantPast
+
+    private func apply(c: (secret: Int, internalCount: Int, info: Int, files: Int), rows: [Store.Row]) {
         model.secret = c.secret
         model.internalCount = c.internalCount
         model.info = c.info
@@ -688,13 +801,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         model.scanned = scanner.scanned
         model.total = scanner.total
         model.needsFullDisk = scanner.needsFullDisk
-        model.rows = store.findings()
+        model.rows = rows
+        model.truncated = rows.count >= 800
         if let d = scanner.lastFinish {
             let f = DateFormatter(); f.dateFormat = "MM-dd HH:mm"
             model.lastFinish = f.string(from: d)
         }
         updateStatusIcon()
-        // 菜单重建有成本，只在状态变化时做
         let sig = "\(scanner.scanning)\(scanner.scanned / 500)\(c.secret)\(c.internalCount)\(c.files)\(idleRescan)\(LoginItem.enabled)"
         if sig != lastMenuSig {
             lastMenuSig = sig
@@ -715,9 +828,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         scanner.start()
     }
 
+    private var rescanBusy = false
+
     /// 只补扫变更路径所在的目录，限制在 200 个文件内
     private func rescan(paths: [String]) {
-        guard !scanner.scanning else { return }
+        guard !scanner.scanning, !rescanBusy else { return }
+        rescanBusy = true
+        defer { rescanBusy = false }
         DispatchQueue.global(qos: .utility).async { [weak self] in
             guard let self else { return }
             for p in paths.prefix(200) {
@@ -733,9 +850,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     var isDir: ObjCBool = false
                     guard FileManager.default.fileExists(atPath: full, isDirectory: &isDir), !isDir.boolValue else { continue }
                     let u = URL(fileURLWithPath: full)
+                    let v = try? u.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
+                    if let old = self.store.fileState(full),
+                       old.size == (v?.fileSize ?? 0),
+                       abs(old.mtime - (v?.contentModificationDate?.timeIntervalSince1970 ?? 0)) < 1 {
+                        continue      // 没变就不重查，省掉重复 OCR
+                    }
                     var r = Confidential.Result()
                     Confidential.inspectFileForCLI(u, ocr: true, into: &r)
                     self.store.replaceFindings(path: full, with: r.findings)
+                    self.store.markScanned(full,
+                                           mtime: v?.contentModificationDate?.timeIntervalSince1970 ?? 0,
+                                           size: v?.fileSize ?? 0)
                 }
             }
             DispatchQueue.main.async { self.refresh() }
@@ -747,22 +873,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         else { model.selected.insert(path) }
     }
 
+    private var cancelProcessing = false
+    private var trashByPath: [String: String] = [:]
+
     /// 单条或批量：原件进回收目录，副本回原位，然后按复检结果更新清单
     private func declass(_ paths: [String]) {
         guard !paths.isEmpty, !model.processing else { return }
         model.processing = true
         model.status = [:]
+        model.processingDone = 0
+        model.processingTotal = paths.count
+        cancelProcessing = false
         Log.w("declass: 开始处理 \(paths.count) 个文件")
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
             var ok = 0, bad = 0
             for p in paths {
+                if self.cancelProcessing { break }
                 let url = URL(fileURLWithPath: p)
                 let out = Declass.apply(file: url, ocr: true,
                                         trashDir: URL(fileURLWithPath: Config.trashDir))
                 DispatchQueue.main.async {
-                    self.model.status[p] = out.ok ? "已脱密" : "失败：\(out.error ?? "未知")"
+                    self.model.processingDone += 1
+                    if out.ok {
+                        self.model.status[p] = "已脱密"
+                        self.model.undoable.insert(p)
+                        if let t = out.trashedTo { self.trashByPath[p] = t }
+                    } else {
+                        self.model.status[p] = "没成功：\(out.error ?? "未知")"
+                    }
                 }
                 if out.ok {
                     ok += 1
@@ -780,6 +920,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             DispatchQueue.main.async {
                 self.model.processing = false
                 self.model.selected = []
+                self.model.processingTotal = 0
                 self.refresh()
                 Log.w("declass: 完成 ok=\(ok) failed=\(bad)")
                 Notifier.post(title: ok > 0 ? "已脱密 \(ok) 个文件" : "脱密没有完成",
@@ -787,6 +928,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                 ? "原件在回收目录，确认后请删除" + (bad > 0 ? "；\(bad) 个失败" : "")
                                 : "原件都没有改动")
             }
+        }
+    }
+
+    /// 撤销：删掉干净副本，把原件从回收目录搬回来，再重扫一次
+    private func undo(_ path: String) {
+        guard let trash = trashByPath[path] else { return }
+        let url = URL(fileURLWithPath: path)
+        do {
+            if FileManager.default.fileExists(atPath: url.path) {
+                try FileManager.default.removeItem(at: url)
+            }
+            try Declass.transfer(URL(fileURLWithPath: trash), url)
+            model.status[path] = "已还原"
+            model.undoable.remove(path)
+            trashByPath[path] = nil
+            Log.w("undo: 已还原 \(path)")
+            rescan(paths: [path])
+        } catch {
+            model.status[path] = "没成功：还原失败"
+            Log.w("undo failed \(path): \(error.localizedDescription)")
         }
     }
 
@@ -837,7 +998,19 @@ final class DirWatcher {
         self.onChange = onChange
     }
 
+    deinit { stop() }
+
+    func stop() {
+        timer?.invalidate(); timer = nil
+        guard let stream else { return }
+        FSEventStreamStop(stream)
+        FSEventStreamInvalidate(stream)
+        FSEventStreamRelease(stream)
+        self.stream = nil
+    }
+
     func start() {
+        guard stream == nil else { return }
         var ctx = FSEventStreamContext(version: 0, info: Unmanaged.passUnretained(self).toOpaque(),
                                        retain: nil, release: nil, copyDescription: nil)
         let cb: FSEventStreamCallback = { _, info, count, eventPaths, _, _ in
@@ -935,53 +1108,84 @@ if args.first == "--process", let target = args.dropFirst().first {
     exit(bad == 0 ? 0 : 1)
 }
 
-// --preview <目录>：离屏渲染主窗口，用于视觉核对（不读真实文件）
+// --preview <目录>：离屏渲染主窗口的几种状态，用于视觉评审（不读真实文件）
 if args.first == "--preview" {
+    // 预览只是出图：摘掉 delegate，别让它真的去扫盘、写库
+    app.delegate = nil
     let dir = args.dropFirst().first ?? "/tmp/baomi-preview"
     try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
     app.setActivationPolicy(.accessory)
     DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
-        let m = Model()
-        m.scanning = true
-        m.scanned = 25560
-        m.total = 91219
-        m.files = 25560
-        m.secret = 3
-        m.internalCount = 81
-        m.info = 37132
-        m.lastFinish = "10-23 21:40"
-        m.rows = [
-            .init(path: "/Users/serena/Desktop/绝密材料.txt", kind: "密级标志", level: 4,
-                  place: "正文", value: "绝密", note: "",
-                  ctx: "「绝密」★ 保密期限 30 年 本文件仅限内部传阅"),
-            .init(path: "/Users/serena/Desktop/扫描件-机密.pdf", kind: "密级标志", level: 3,
-                  place: "1 页·OCR", value: "机密", note: "",
-                  ctx: "「机密」★ 保密期限 10 年 关于第三季度经营情况的通报"),
-            .init(path: "/Users/serena/Desktop/报告.docx", kind: "修订痕迹", level: 1,
-                  place: "正文", value: "修订记录", note: "",
-                  ctx: "文档被改过 2 次，历史内容可能仍在"),
-            .init(path: "/Users/serena/Desktop/照片.jpg", kind: "照片位置", level: 0,
-                  place: "GPS", value: "拍摄位置", note: "",
-                  ctx: "照片会暴露拍摄地点"),
-        ]
-        m.selected = ["/Users/serena/Desktop/报告.docx"]
-        for scheme in [ColorScheme.light, .dark] {
-            let view = MainView(model: m, onScan: {}, onStop: {}, onReveal: { _ in },
-                                onOpenSettings: {}, onToggle: { _ in }, onProcess: { _ in },
-                                onSelectAll: { _ in }, onOpenTrash: {},
-                                preview: true)
-                .environment(\.colorScheme, scheme)
-            let r = ImageRenderer(content: view)
-            r.scale = 2
-            r.isOpaque = true
-            if let cg = r.cgImage {
-                let rep = NSBitmapImageRep(cgImage: cg)
-                let name = scheme == .dark ? "main-dark.png" : "main.png"
-                try? rep.representation(using: .png, properties: [:])?
-                    .write(to: URL(fileURLWithPath: dir + "/" + name))
-                print("wrote \(name) \(cg.width)x\(cg.height)")
+        func base() -> Model {
+            let m = Model()
+            m.files = 25560
+            m.lastFinish = "10-23 21:40"
+            return m
+        }
+        func rows() -> [Store.Row] {
+            [
+                .init(path: "/Users/serena/Desktop/绝密材料.txt", kind: "密级标志", level: 4,
+                      place: "正文", value: "绝密", note: "",
+                      ctx: "「绝密」★ 保密期限 30 年 本文件仅限内部传阅"),
+                .init(path: "/Users/serena/Desktop/扫描件-机密.pdf", kind: "密级标志", level: 3,
+                      place: "1 页·OCR", value: "机密", note: "",
+                      ctx: "「机密」★ 保密期限 10 年 关于第三季度经营情况的通报"),
+                .init(path: "/Users/serena/Desktop/报告.docx", kind: "修订痕迹", level: 1,
+                      place: "正文", value: "修订记录", note: "",
+                      ctx: "文档被改过 2 次，历史内容可能仍在"),
+                .init(path: "/Users/serena/Desktop/照片.jpg", kind: "照片位置", level: 0,
+                      place: "GPS", value: "拍摄位置", note: "",
+                      ctx: "照片会暴露拍摄地点"),
+            ]
+        }
+
+        var cases: [(String, Model)] = []
+
+        let scanning = base()
+        scanning.scanning = true; scanning.scanned = 25560; scanning.total = 91219
+        scanning.secret = 3; scanning.internalCount = 81; scanning.info = 37132
+        scanning.rows = rows(); scanning.selected = ["/Users/serena/Desktop/报告.docx"]
+        cases.append(("scanning", scanning))
+
+        let idle = base()
+        idle.secret = 3; idle.internalCount = 81; idle.info = 37132
+        idle.rows = rows()
+        cases.append(("idle", idle))
+
+        let empty = base()
+        cases.append(("empty", empty))
+
+        let processing = base()
+        processing.secret = 1; processing.rows = rows().prefix(2).map { $0 }
+        processing.processing = true
+        processing.status = ["/Users/serena/Desktop/绝密材料.txt": "已脱密"]
+        cases.append(("processing", processing))
+
+        let noPermission = base()
+        noPermission.needsFullDisk = true; noPermission.rows = rows()
+        cases.append(("noperm", noPermission))
+
+        for (name, m) in cases {
+            for scheme in [ColorScheme.light, .dark] {
+                let view = MainView(model: m, onScan: {}, onStop: {}, onReveal: { _ in },
+                                    onOpenSettings: {}, onToggle: { _ in }, onProcess: { _ in },
+                                    onSelectAll: { _ in }, onOpenTrash: {},
+                                    onUndo: { _ in }, onStopProcessing: {},
+                                    preview: true)
+                    .frame(width: 600, height: 560)
+                    .environment(\.colorScheme, scheme)
+                let r = ImageRenderer(content: view)
+                r.scale = 2
+                r.isOpaque = true
+                if let cg = r.cgImage {
+                    let rep = NSBitmapImageRep(cgImage: cg)
+                    let file = name + (scheme == .dark ? "-dark" : "") + ".png"
+                    try? rep.representation(using: .png, properties: [:])?
+                        .write(to: URL(fileURLWithPath: dir + "/" + file))
+                }
             }
         }
+        print("wrote \(cases.count * 2) previews to \(dir)")
         exit(0)
     }
     app.run()
