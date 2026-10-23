@@ -4,6 +4,7 @@
 import Cocoa
 import SwiftUI
 import CoreServices
+import IOKit
 
 // MARK: - 日志
 
@@ -38,6 +39,47 @@ enum Config {
     static let maxFiles = 2_000_000
 }
 
+// MARK: - 开机自启（LaunchAgent）
+
+enum LoginItem {
+    static let label = "com.serena.baomijiancha"
+    static var path: String { NSHomeDirectory() + "/Library/LaunchAgents/\(label).plist" }
+    static var enabled: Bool { FileManager.default.fileExists(atPath: path) }
+
+    static func install() {
+        let exe = Bundle.main.executablePath ?? Config.appPath + "/Contents/MacOS/Baomi"
+        let plist = """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        <plist version="1.0"><dict>
+          <key>Label</key><string>\(label)</string>
+          <key>ProgramArguments</key><array><string>\(exe)</string></array>
+          <key>RunAtLoad</key><true/>
+          <key>KeepAlive</key><false/>
+          <key>ProcessType</key><string>Interactive</string>
+        </dict></plist>
+        """
+        let dir = (path as NSString).deletingLastPathComponent
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        try? plist.data(using: .utf8)?.write(to: URL(fileURLWithPath: path))
+        _ = Shell.run("/bin/launchctl", ["unload", path])
+        _ = Shell.run("/bin/launchctl", ["load", path])
+        Log.w("login: 已开启开机自启 \(path)")
+    }
+
+    static func remove() {
+        _ = Shell.run("/bin/launchctl", ["unload", path])
+        try? FileManager.default.removeItem(atPath: path)
+        Log.w("login: 已关闭开机自启")
+    }
+}
+
+/// 系统空闲了多少秒（任意输入都算）
+func systemIdleSeconds() -> Double {
+    let anyInput = CGEventType(rawValue: ~0)!
+    return CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: anyInput)
+}
+
 // MARK: - 扫描器
 
 final class Scanner {
@@ -50,6 +92,7 @@ final class Scanner {
     private(set) var scanned = 0
     private(set) var total = 0
     private(set) var lastFinish: Date?
+    private(set) var lastStart: Date?
     private(set) var needsFullDisk = false
     var onChange: (() -> Void)?
 
@@ -77,6 +120,7 @@ final class Scanner {
         guard !scanning else { return }
         stopFlag = false
         scanning = true
+        lastStart = Date()
         onChange?()
         let item = DispatchWorkItem { [weak self] in self?.run() }
         work = item
@@ -358,6 +402,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let model = Model()
     private var windowCtl: WindowController!
     private var watcher: DirWatcher?
+    private var idleTimer: Timer?
+    private var lastMenuSig = ""
+
+    /// 空闲 2 小时后自动重扫
+    private var idleRescan: Bool {
+        get { UserDefaults.standard.object(forKey: "idleRescan") as? Bool ?? true }
+        set { UserDefaults.standard.set(newValue, forKey: "idleRescan"); rebuildMenu() }
+    }
 
     func applicationDidFinishLaunching(_ n: Notification) {
         Log.w("app: 启动，roots=\(Scanner.roots().map(\.path).joined(separator: ","))")
@@ -377,20 +429,89 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self?.rescan(paths: changed)
         }
         watcher?.start()
+
+        // 第一次运行就装上开机自启，之后交给菜单里的开关
+        if !LoginItem.enabled && UserDefaults.standard.object(forKey: "loginInstalled") == nil {
+            LoginItem.install()
+            UserDefaults.standard.set(true, forKey: "loginInstalled")
+        }
+
+        idleTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
+            self?.checkIdleRescan()
+        }
     }
 
     private func buildStatusItem() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        statusItem.button?.title = "保密检查"
+        if let b = statusItem.button {
+            b.imagePosition = .imageLeading
+            b.imageScaling = .scaleProportionallyDown
+        }
+        rebuildMenu()
+    }
+
+    /// 菜单栏图标就是状态：扫的时候是实心盾，闲着是勾盾，停了是暂停。
+    private func updateStatusIcon() {
+        guard let b = statusItem.button else { return }
+        let symbol: String
+        if scanner.scanning { symbol = "shield.lefthalf.filled" }
+        else if let last = scanner.lastFinish, Date().timeIntervalSince(last) < 3600 * 24 { symbol = "checkmark.shield" }
+        else { symbol = "shield" }
+        let cfg = NSImage.SymbolConfiguration(pointSize: 15, weight: .regular)
+        let img = NSImage(systemSymbolName: symbol, accessibilityDescription: "保密检查")?
+            .withSymbolConfiguration(cfg)
+        img?.isTemplate = true
+        b.image = img
+        let c = store.counts()
+        b.title = c.secret > 0 ? " \(c.secret)" : ""
+        b.toolTip = scanner.scanning
+            ? "正在扫描 \(scanner.scanned)/\(scanner.total)"
+            : "保密检查 · 已索引 \(c.files) 个文件"
+    }
+
+    private func rebuildMenu() {
+        guard let statusItem else { return }
+        let c = store.counts()
         let menu = NSMenu()
-        menu.addItem(NSMenuItem(title: "打开清单", action: #selector(showWindow), keyEquivalent: ""))
-        menu.addItem(NSMenuItem(title: "立即扫描", action: #selector(scanNow), keyEquivalent: "r"))
-        menu.addItem(NSMenuItem(title: "停止扫描", action: #selector(stopNow), keyEquivalent: ""))
+
+        let state = NSMenuItem(title: scanner.scanning
+                               ? "正在扫描 \(scanner.scanned)/\(scanner.total)"
+                               : "空闲 · 已索引 \(c.files) 个文件", action: nil, keyEquivalent: "")
+        state.isEnabled = false
+        menu.addItem(state)
+
+        let summary = NSMenuItem(title: "秘密标志 \(c.secret) · 内部 \(c.internalCount) · 提示 \(c.info)",
+                                 action: nil, keyEquivalent: "")
+        summary.isEnabled = false
+        menu.addItem(summary)
+
+        if let last = scanner.lastFinish {
+            let f = DateFormatter(); f.dateFormat = "MM-dd HH:mm"
+            let done = NSMenuItem(title: "上次完成 \(f.string(from: last))", action: nil, keyEquivalent: "")
+            done.isEnabled = false
+            menu.addItem(done)
+        }
         menu.addItem(.separator())
-        menu.addItem(NSMenuItem(title: "安装开机自启", action: #selector(installAgent), keyEquivalent: ""))
+
+        menu.addItem(NSMenuItem(title: "打开清单", action: #selector(showWindow), keyEquivalent: ""))
+        if scanner.scanning {
+            menu.addItem(NSMenuItem(title: "停止扫描", action: #selector(stopNow), keyEquivalent: ""))
+        } else {
+            menu.addItem(NSMenuItem(title: "立即扫描", action: #selector(scanNow), keyEquivalent: "r"))
+        }
+        menu.addItem(.separator())
+
+        let idle = NSMenuItem(title: "空闲 2 小时后自动重扫", action: #selector(toggleIdle), keyEquivalent: "")
+        idle.state = idleRescan ? .on : .off
+        menu.addItem(idle)
+
+        let login = NSMenuItem(title: "开机自启", action: #selector(toggleLogin), keyEquivalent: "")
+        login.state = LoginItem.enabled ? .on : .off
+        menu.addItem(login)
+
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "退出", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
-        for item in menu.items { item.target = self }
+        for item in menu.items where item.action != nil { item.target = self }
         statusItem.menu = menu
     }
 
@@ -409,7 +530,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let f = DateFormatter(); f.dateFormat = "MM-dd HH:mm"
             model.lastFinish = f.string(from: d)
         }
-        statusItem.button?.title = c.secret > 0 ? "保密检查 ●\(c.secret)" : "保密检查"
+        updateStatusIcon()
+        // 菜单重建有成本，只在状态变化时做
+        let sig = "\(scanner.scanning)\(scanner.scanned / 500)\(c.secret)\(c.internalCount)\(c.files)\(idleRescan)\(LoginItem.enabled)"
+        if sig != lastMenuSig {
+            lastMenuSig = sig
+            rebuildMenu()
+        }
+    }
+
+    private func checkIdleRescan() {
+        guard idleRescan, !scanner.scanning else { return }
+        let limit = Double(ProcessInfo.processInfo.environment["BAOMI_IDLE_SECONDS"] ?? "") ?? 7200
+        let idle = systemIdleSeconds()
+        let since = Date().timeIntervalSince(scanner.lastStart ?? .distantPast)
+        if ProcessInfo.processInfo.environment["BAOMI_IDLE_SECONDS"] != nil {
+            Log.w(String(format: "idle-check: idle=%.1f since=%.1f limit=%.1f", idle, since, limit))
+        }
+        guard idle >= limit, since >= limit else { return }
+        Log.w(String(format: "idle: 空闲 %.0f 分钟，重新开扫", idle / 60))
+        scanner.start()
     }
 
     /// 只补扫变更路径所在的目录，限制在 200 个文件内
@@ -442,6 +582,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func showWindow() { windowCtl.show() }
     @objc private func scanNow() { scanner.start() }
     @objc private func stopNow() { scanner.stop() }
+
+    @objc private func toggleIdle() { idleRescan.toggle() }
+
+    @objc private func toggleLogin() {
+        if LoginItem.enabled { LoginItem.remove() } else { LoginItem.install() }
+        rebuildMenu()
+    }
 
     @objc private func installAgent() {
         let plist = """
@@ -522,6 +669,14 @@ final class DirWatcher {
 // MARK: - 启动
 
 let app = NSApplication.shared
+
+// 单实例：开机自启与手动打开同时发生时，只留一个进程，避免两份扫描抢磁盘
+if CommandLine.arguments.count <= 1,
+   let bid = Bundle.main.bundleIdentifier,
+   NSRunningApplication.runningApplications(withBundleIdentifier: bid).count > 1 {
+    exit(0)
+}
+
 let delegate = AppDelegate()
 app.delegate = delegate
 

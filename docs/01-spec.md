@@ -26,6 +26,19 @@
   └─ WindowController（SwiftUI 清单）
 ```
 
+## 菜单栏与生命周期
+
+| 状态 | 图标 | 标题 |
+|---|---|---|
+| 正在扫描 | `shield.lefthalf.filled`（template） | 有秘密命中时显示数字 |
+| 今天扫过 | `checkmark.shield` | 同上 |
+| 尚未完成过 | `shield` | 同上 |
+
+- 启动即扫：`applicationDidFinishLaunching` 里直接 `scanner.start()`
+- 开机自启：`~/Library/LaunchAgents/com.serena.baomijiancha.plist`，`RunAtLoad`；首次运行自动安装
+- 单实例：检测同 bundle id 的其他进程，有则退出
+- 空闲重扫：60 秒轮询 `CGEventSourceSecondsSinceLastEventType`，空闲 ≥ 2h 且距上次 start ≥ 2h 才开扫（测试可用 `BAOMI_IDLE_SECONDS` 覆盖阈值）
+
 ## 数据模型
 
 | 表 | 字段 | 说明 |
