@@ -360,6 +360,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var watcher: DirWatcher?
 
     func applicationDidFinishLaunching(_ n: Notification) {
+        Log.w("app: 启动，roots=\(Scanner.roots().map(\.path).joined(separator: ","))")
         NSApp.setActivationPolicy(.accessory)
         store = Store(path: Config.dbPath)
         scanner = Scanner(store: store)
@@ -368,6 +369,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         scanner.onChange = { [weak self] in self?.refresh() }
         buildStatusItem()
         refresh()
+        Log.w("app: 开始首次扫描")
         scanner.start()
 
         // 变了就补扫：只补变更的目录，不重扫全盘
@@ -528,7 +530,16 @@ let args = Array(CommandLine.arguments.dropFirst())
 // --scan <路径> [--json]：命令行只读体检，便于验证
 if args.first == "--scan", let target = args.dropFirst().first {
     let ocr = !args.contains("--no-ocr")
-    let r = Confidential.scan(root: URL(fileURLWithPath: target), ocr: ocr)
+    let url = URL(fileURLWithPath: target)
+    var isDir: ObjCBool = false
+    FileManager.default.fileExists(atPath: target, isDirectory: &isDir)
+    var r = Confidential.Result()
+    if isDir.boolValue {
+        r = Confidential.scan(root: url, ocr: ocr)
+    } else {
+        Confidential.inspectFileForCLI(url, ocr: ocr, into: &r)
+        r.seconds = 0
+    }
     if args.contains("--json") { print(r.json) } else { print(r.text()) }
     exit(0)
 }

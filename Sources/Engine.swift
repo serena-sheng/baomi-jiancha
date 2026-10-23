@@ -616,21 +616,24 @@ enum Confidential {
     /// 不该被读成密级的上下文：商业秘密、个人隐私、解密新闻
     private static let levelExceptions = ["商业秘密", "个人秘密", "技术秘密", "私密", "解密", "泄密", "保密法", "保密工作", "保密协议"]
 
+    /// 只认「标志」不认「提到」：密级标志是独占一行、通常跟星号或期限的短语；
+    /// 正文里说「绝密级公文如何如何」不算。全盘扫描对这一条极敏感。
     static func classification(in text: String) -> (SecretLevel, String)? {
-        // 密级标志通常出现在文首；扫描件 OCR 后也可能出现在任意行首
-        let head = String(text.prefix(3000))
+        let head = String(text.prefix(4000))
         var best: (SecretLevel, String)? = nil
-        for (level, pattern) in levelRules {
-            guard let re = try? NSRegularExpression(pattern: pattern) else { continue }
-            let ns = head as NSString
-            for m in re.matches(in: head, range: NSRange(location: 0, length: ns.length)) {
-                let start = max(0, m.range.location - 6)
-                let ctxRange = NSRange(location: start, length: min(ns.length - start, m.range.length + 12))
-                let ctx = ns.substring(with: ctxRange)
-                if levelExceptions.contains(where: { ctx.contains($0) }) { continue }
+        for rawLine in head.split(separator: "\n", omittingEmptySubsequences: false) {
+            let line = String(rawLine).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !line.isEmpty, line.count <= 40 else { continue }
+            if levelExceptions.contains(where: { line.contains($0) }) { continue }
+            for (level, pattern) in levelRules {
+                guard let re = try? NSRegularExpression(pattern: pattern) else { continue }
+                let ns = line as NSString
+                guard let m = re.firstMatch(in: line, range: NSRange(location: 0, length: ns.length)) else { continue }
+                let markerish = ["★", "☆", "*", "期限", "密级", "级"].contains { line.contains($0) }
+                let atLineStart = m.range.location <= 6
+                guard markerish || atLineStart else { continue }
                 let matched = ns.substring(with: m.range)
                 if best == nil || level > best!.0 { best = (level, matched) }
-                break
             }
         }
         return best
@@ -772,12 +775,7 @@ enum Confidential {
             scanText(t, file: rel, place: "二进制正文（位置未定位）", into: &r)
             if r.findings.count > before { found = true }
         }
-        let gb = CFStringConvertEncodingToNSStringEncoding(CFStringEncoding(CFStringEncodings.GB_18030_2000.rawValue))
-        if let t = String(data: raw, encoding: String.Encoding(rawValue: gb)) {
-            let before = r.findings.count
-            scanText(t, file: rel, place: "二进制正文（位置未定位）", into: &r)
-            if r.findings.count > before { found = true }
-        }
+
         let cjk = textCJKCount(raw)
         if cjk < 30 {
             r.findings.append(ConfFinding(kind: .unscannable, file: rel, place: "二进制",
