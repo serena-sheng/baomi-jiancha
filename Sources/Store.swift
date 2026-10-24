@@ -7,7 +7,7 @@ final class Store {
     private var db: OpaquePointer?
     let path: String
     /// 判定口径的版本：改一次这里，就会清索引重扫一遍（见 init）
-    static let rulesVersion = "3"
+    static let rulesVersion = "4"
     /// 后台扫描与界面会同时访问；自己加锁，不指望驱动层的线程模式
     private let lock = NSLock()
 

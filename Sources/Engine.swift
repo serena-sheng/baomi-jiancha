@@ -121,7 +121,7 @@ enum OCR {
     }
 
     /// PDF 单页栅格化后识别：200dpi 对中文印刷体够用，再高只是变慢
-    static func text(from page: PDFPage, dpi: CGFloat = 200) -> String {
+    static func text(from page: PDFPage, dpi: CGFloat = 150) -> String {
         let rect = page.bounds(for: .mediaBox)
         let scale = dpi / 72.0
         let w = Int(rect.width * scale), h = Int(rect.height * scale)
@@ -168,7 +168,7 @@ enum OCR {
         return out
     }
 
-    static func text(fromImageAt url: URL, maxPixel: CGFloat = 3000) -> String {
+    static func text(fromImageAt url: URL, maxPixel: CGFloat = 2400) -> String {
         guard let src = CGImageSourceCreateWithURL(url as CFURL, nil),
               let img = CGImageSourceCreateImageAtIndex(src, 0, nil) else { return "" }
         let longest = CGFloat(max(img.width, img.height))
@@ -903,22 +903,36 @@ enum Confidential {
 
     static func inspectOOXML(_ u: URL, rel: String, into r: inout Result) {
         let path = u.path
-        let parts = zipList(path)
-        guard !parts.isEmpty else {
+        // 一次调用把正文成员全取出来：原先每个成员一次 unzip，一个 docx 就要起十几个进程，
+        // 扫描几万个文件时进程启动本身比读内容还贵
+        let patterns: [String]
+        switch u.pathExtension.lowercased() {
+        case "xlsx", "xlsm":
+            patterns = ["xl/sharedStrings.xml", "xl/worksheets/*.xml"]
+        case "pptx", "pptm":
+            patterns = ["ppt/slides/*.xml", "ppt/notesSlides/*.xml"]
+        default:
+            patterns = ["word/document.xml", "word/header*.xml", "word/footer*.xml",
+                        "word/footnotes.xml", "word/endnotes.xml"]
+        }
+        // unzip 只要有一个通配符没匹配上就返回 11，所以看输出、不看退出码
+        let res = Shell.run("/usr/bin/unzip", ["-p", path] + patterns, timeout: 60)
+        var raw = res.out
+        guard !raw.isEmpty else {
             r.findings.append(ConfFinding(kind: .unscannable, file: rel, place: "—",
                                           value: "zip", note: "打不开（可能加密），内容未检查", level: .info))
             return
         }
-        // 宏、嵌入对象、文档属性、修订、批注都不再单独报；
-        // 真正脱密时会连同这些一起清掉（见 Declass.cleanOOXML）
-        let bodyParts = parts.filter { $0.hasSuffix(".xml") && (
-            $0.hasPrefix("word/") || $0.hasPrefix("xl/") || $0.hasPrefix("ppt/")) }
-        var text = ""
-        for part in bodyParts.prefix(12) {
-            guard let xml = zipMember(path, part) else { continue }
-            if text.count < maxTextChars { text += stripXML(xml) }
+        // 几百万字的表格没必要整篇扫：取前 4 MB，密级标志在卷首
+        if raw.count > 4_000_000 { raw = String(raw.prefix(4_000_000)) }
+        // 段落结束转成换行：密级标志要求「独占一行」，全压成一行就永远判不出来
+        var text = raw
+        for (tag, sep) in [("</w:p>", "\n"), ("</a:p>", "\n"), ("</si>", "\n"), ("<w:br/>", "\n")] {
+            text = text.replacingOccurrences(of: tag, with: sep)
         }
-        scanText(text, file: rel, place: "正文", into: &r)
+        // 各成员拼在一起扫即可：只要文字，不必区分来自哪个成员
+        scanText(stripXML(text), file: rel, place: "正文", into: &r)
+        r.scannedTextFiles += 1
     }
 
     static func firstTag(_ xml: String, _ tag: String) -> String? {
