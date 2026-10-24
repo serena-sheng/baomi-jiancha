@@ -6,6 +6,8 @@ import SQLite3
 final class Store {
     private var db: OpaquePointer?
     let path: String
+    /// 判定口径的版本：改一次这里，就会清索引重扫一遍（见 init）
+    static let rulesVersion = "2"
     /// 后台扫描与界面会同时访问；自己加锁，不指望驱动层的线程模式
     private let lock = NSLock()
 
@@ -36,6 +38,15 @@ final class Store {
         // 否则它们会以新标签重新出现在清单里
         exec("DELETE FROM findings WHERE kind NOT IN ('密级标志','无法检查');")
         exec("DELETE FROM findings WHERE kind='密级标志' AND level=1 AND value<>'工作秘密';")
+
+        // 判定规则一换，旧结论就不可信了；指纹也得一起清，否则没改过的文件永远不会被重判
+        // （只删命中不清指纹，就会留下按旧规则判出来的假阳性）
+        if meta("rulesVersion") != Self.rulesVersion {
+            exec("DELETE FROM findings;")
+            exec("DELETE FROM files;")
+            setMeta("rulesVersion", Self.rulesVersion)
+            Log.w("store: 判定规则换代（\(Self.rulesVersion)），索引已清空，等一次全量重扫")
+        }
     }
 
     deinit { sqlite3_close(db) }
