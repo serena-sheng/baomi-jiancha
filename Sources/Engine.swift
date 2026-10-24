@@ -635,7 +635,13 @@ enum Confidential {
             // 工作秘密单独认：它含「秘密」二字，按国密规则会被误读成「秘密★」；
             // 「内部资料 / 内部使用 / 注意保密」这类不再算任何等级
             if line.contains("工作秘密") {
-                if best == nil { best = (.workSecret, "工作秘密") }
+                // 和国密用同一套「标志」判据：位置太靠后、又带逗号句号的是正文叙述
+                let pos = (line as NSString).range(of: "工作秘密").location
+                let marked = ["★", "☆", "*", "期限"].contains { line.contains($0) }
+                let prose = line.contains("，") || line.contains("。") || line.contains("；")
+                if (marked || pos <= 3) && !(prose && !marked) {
+                    if best == nil { best = (.workSecret, "工作秘密") }
+                }
                 continue
             }
             for (level, pattern) in levelRules {
