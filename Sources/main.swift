@@ -1,5 +1,6 @@
 // 保密检查 — macOS 常驻后台全盘扫描
-// 只读检查：找密级标志、内部痕迹、证件号、文档属性、扫描件里的字。
+// 只读检查：只找国家秘密与工作秘密的密级标志（含扫描件里的字）。
+// 内部资料、证件号、文档属性、照片位置一律不报——口径窄一点，清单才有用。
 // 本地、离线、不写内容进日志；结果存本机 SQLite。
 import Cocoa
 import SwiftUI
@@ -248,9 +249,9 @@ final class Scanner {
             self.onChange?()
         }
         let secs = Date().timeIntervalSince(started)
-        Log.w(String(format: "scan: 完成 %d 个文件，%.1f 秒，命中 secret=%d internal=%d",
+        Log.w(String(format: "scan: 完成 %d 个文件，%.1f 秒，命中 secret=%d work=%d",
                      seen, secs,
-                     store.counts().secret, store.counts().internalCount))
+                     store.counts().secret, store.counts().work))
     }
 
     private func inspect(_ u: URL) {
@@ -289,7 +290,7 @@ final class Scanner {
 final class Model: ObservableObject {
     @Published var rows: [Store.Row] = []
     @Published var secret = 0
-    @Published var internalCount = 0
+    @Published var work = 0
     @Published var info = 0
     @Published var files = 0
     @Published var scanning = false
@@ -367,6 +368,7 @@ struct RowView: View {
 
     private var level: SecretLevel { SecretLevel(rawValue: row.level) ?? .info }
     private var isSecret: Bool { level.isStateSecret }
+    private var isWork: Bool { level == .workSecret }
 
     var body: some View {
         HStack(alignment: .top, spacing: T.gap) {
@@ -375,9 +377,10 @@ struct RowView: View {
 
             VStack(alignment: .leading, spacing: 3) {
                 HStack(alignment: .firstTextBaseline, spacing: 6) {
-                    JPDot(color: isSecret ? T.warn : (level == .internalOnly ? T.ink2 : T.ink3))
+                    JPDot(color: isSecret ? T.warn : (isWork ? T.ink2 : T.ink3))
                         .offset(y: -1)
-                    Text(isSecret ? level.label : (level == .internalOnly ? "内部" : "提示"))
+                    // 无法检查这类信息也占一行，但只作为覆盖提示，不算命中
+                    Text(isSecret || isWork ? level.label : "未检查")
                         .font(.jpC)
                         .foregroundStyle(isSecret ? T.warn : T.ink3)
                     Text((row.path as NSString).lastPathComponent)
@@ -412,8 +415,11 @@ struct RowView: View {
                             .buttonStyle(.plain)
                             .help("在访达中显示")
                         }
-                        JPButton(title: "脱密", kind: .ghost, enabled: !disabled,
-                                 compact: true, action: onProcess)
+                        // 「未检查」不是命中，脱不了密，别给一个点了只会报错的按钮
+                        if level.isReportable {
+                            JPButton(title: "脱密", kind: .ghost, enabled: !disabled,
+                                     compact: true, action: onProcess)
+                        }
                     }
                 }
                 if !row.ctx.isEmpty {
@@ -523,7 +529,7 @@ struct MainView: View {
                 Text(num(model.secret)).font(.jpT)
                     .foregroundStyle(model.secret > 0 ? T.ink : T.ink3)
                 Text("个秘密标志").font(.jpC).foregroundStyle(T.ink2)
-                Text("· \(num(model.internalCount)) 内部 · \(num(model.info)) 提示 · 共 \(num(model.totalHits)) 条命中")
+                Text("· \(num(model.work)) 工作秘密 · \(num(model.info)) 未检查 · 共 \(num(model.totalHits)) 条命中")
                     .font(.jpC).foregroundStyle(T.ink3)
                 if model.needsFullDisk {
                     Text("（不完整）").font(.jpC).foregroundStyle(T.warn)
@@ -685,7 +691,7 @@ struct MainView: View {
                 JPButton(title: "开始扫描", kind: .ghost, action: onScan)
                     .keyboardShortcut("r", modifiers: .command)
             }
-            JPButton(title: model.onlySecrets ? "只看秘密 ✓" : "只看秘密", kind: .ghost) { onToggleFilter() }
+            JPButton(title: model.onlySecrets ? "只看国家秘密 ✓" : "只看国家秘密", kind: .ghost) { onToggleFilter() }
             if !model.rows.isEmpty {
                 JPButton(title: "全选本页", kind: .ghost) { onSelectPage() }
                     .keyboardShortcut("a", modifiers: .command)
@@ -873,7 +879,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// 菜单栏图标就是状态：扫的时候是实心盾，闲着是勾盾，停了是暂停。
-    private func updateStatusIcon(_ c: (secret: Int, internalCount: Int, info: Int, files: Int)? = nil) {
+    private func updateStatusIcon(_ c: (secret: Int, work: Int, info: Int, files: Int)? = nil) {
         guard let b = statusItem.button else { return }
         let symbol: String
         if scanner.scanning { symbol = "shield.lefthalf.filled" }
@@ -891,7 +897,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             : "保密检查 · \(k.secret) 个秘密标志 · 已索引 \(k.files) 个文件"
     }
 
-    private func rebuildMenu(_ cached: (secret: Int, internalCount: Int, info: Int, files: Int)? = nil) {
+    private func rebuildMenu(_ cached: (secret: Int, work: Int, info: Int, files: Int)? = nil) {
         guard let statusItem else { return }
         let c = cached ?? store.counts()
         let menu = NSMenu()
@@ -902,7 +908,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         state.isEnabled = false
         menu.addItem(state)
 
-        let summary = NSMenuItem(title: "秘密标志 \(c.secret) · 内部 \(c.internalCount) · 提示 \(c.info)",
+        let summary = NSMenuItem(title: "国家秘密 \(c.secret) · 工作秘密 \(c.work) · 未检查 \(c.info)",
                                  action: nil, keyEquivalent: "")
         summary.isEnabled = false
         menu.addItem(summary)
@@ -968,9 +974,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var lastScanRefresh = Date.distantPast
     private var lastWasScanning = false
 
-    private func apply(c: (secret: Int, internalCount: Int, info: Int, files: Int), rows: [Store.Row]) {
+    private func apply(c: (secret: Int, work: Int, info: Int, files: Int), rows: [Store.Row]) {
         model.secret = c.secret
-        model.internalCount = c.internalCount
+        model.work = c.work
         model.info = c.info
         model.files = c.files
         model.scanning = scanner.scanning
@@ -990,7 +996,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             model.lastFinish = f.string(from: d)
         }
         updateStatusIcon(c)
-        let sig = "\(scanner.scanning)\(scanner.scanned / 500)\(c.secret)\(c.internalCount)\(c.files)\(idleRescan)\(LoginItem.enabled)"
+        let sig = "\(scanner.scanning)\(scanner.scanned / 500)\(c.secret)\(c.work)\(c.files)\(idleRescan)\(LoginItem.enabled)"
         if sig != lastMenuSig {
             lastMenuSig = sig
             rebuildMenu(c)
@@ -1323,6 +1329,16 @@ if args.first == "--scan", let target = args.dropFirst().first {
     exit(0)
 }
 
+// --probe <文本>：直接打印密级判定结果，调试口径用
+if args.first == "--probe", let t = args.dropFirst().first {
+    if let (level, matched) = Confidential.classification(in: t) {
+        print("命中 level=\(level.rawValue) \(level.label) 匹配=\(matched)")
+    } else {
+        print("不算密级标志")
+    }
+    exit(0)
+}
+
 // --process <路径>：走和界面同一条脱密管线（测试/批处理用）
 if args.first == "--process", let target = args.dropFirst().first {
     let root = URL(fileURLWithPath: target)
@@ -1361,8 +1377,8 @@ if args.first == "--preview" {
             m.files = 25560
             m.lastFinish = "10-23 21:40"
             m.totalHits = 37232
-            m.internalCount = 81
-            m.info = 37132
+            m.work = 1
+            m.info = 0
             m.page = 0
             m.pageSize = 50
             return m
@@ -1375,12 +1391,12 @@ if args.first == "--preview" {
                 .init(path: "/Users/serena/Desktop/扫描件-机密.pdf", kind: "密级标志", level: 3,
                       place: "1 页·OCR", value: "机密", note: "",
                       ctx: "「机密」★ 保密期限 10 年 关于第三季度经营情况的通报"),
-                .init(path: "/Users/serena/Desktop/报告.docx", kind: "修订痕迹", level: 1,
-                      place: "正文", value: "修订记录", note: "",
-                      ctx: "文档被改过 2 次，历史内容可能仍在"),
-                .init(path: "/Users/serena/Desktop/照片.jpg", kind: "照片位置", level: 0,
-                      place: "GPS", value: "拍摄位置", note: "",
-                      ctx: "照片会暴露拍摄地点"),
+                .init(path: "/Users/serena/Desktop/工作方案.docx", kind: "密级标志", level: 1,
+                      place: "正文", value: "工作秘密", note: "",
+                      ctx: "「工作秘密」★ 关于人员调整的初步方案"),
+                .init(path: "/Users/serena/Desktop/加密材料.docx", kind: "无法检查", level: 0,
+                      place: "加密", value: "已加密", note: "",
+                      ctx: "文档加密，内容未检查"),
             ]
         }
 

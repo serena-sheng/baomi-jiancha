@@ -31,6 +31,11 @@ final class Store {
         exec("CREATE INDEX IF NOT EXISTS idx_find_level ON findings(level DESC, found_at DESC);")
         exec("CREATE INDEX IF NOT EXISTS idx_find_path ON findings(path);")
         exec("CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);")
+        // 口径收紧：只留「密级标志」里的国家秘密 / 工作秘密，加「无法检查」。
+        // 旧版本留下的内部资料、证件号、文档属性、修订、批注、照片位置等记录一次清掉，
+        // 否则它们会以新标签重新出现在清单里
+        exec("DELETE FROM findings WHERE kind NOT IN ('密级标志','无法检查');")
+        exec("DELETE FROM findings WHERE kind='密级标志' AND level=1 AND value<>'工作秘密';")
     }
 
     deinit { sqlite3_close(db) }
@@ -208,16 +213,16 @@ final class Store {
         return out
     }
 
-    func counts() -> (secret: Int, internalCount: Int, info: Int, files: Int) {
+    func counts() -> (secret: Int, work: Int, info: Int, files: Int) {
         lock.lock(); defer { lock.unlock() }
-        var secret = 0, internalCount = 0, info = 0, files = 0
+        var secret = 0, work = 0, info = 0, files = 0
         var st: OpaquePointer?
         if sqlite3_prepare_v2(db, "SELECT level, COUNT(*) FROM findings GROUP BY level", -1, &st, nil) == SQLITE_OK {
             while sqlite3_step(st) == SQLITE_ROW {
                 let level = Int(sqlite3_column_int(st, 0))
                 let n = Int(sqlite3_column_int(st, 1))
                 if level >= SecretLevel.secret.rawValue { secret += n }
-                else if level == SecretLevel.internalOnly.rawValue { internalCount += n }
+                else if level == SecretLevel.workSecret.rawValue { work += n }
                 else { info += n }
             }
         }
@@ -228,7 +233,7 @@ final class Store {
             files = Int(sqlite3_column_int(fst, 0))
         }
         sqlite3_finalize(fst)
-        return (secret, internalCount, info, files)
+        return (secret, work, info, files)
     }
 
     func setMeta(_ key: String, _ value: String) {

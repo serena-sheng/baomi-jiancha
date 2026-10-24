@@ -56,8 +56,8 @@ enum Shell {
 }
 
 enum SecretLevel: Int, Comparable {
-    case info = 0          // 提示：元数据、个人信息、无法检查
-    case internalOnly = 1  // 内部 / 工作秘密：不是国家秘密
+    case info = 0          // 提示：只剩「无法检查」这类覆盖说明，不进清单、不参与脱密
+    case workSecret = 1    // 工作秘密：不是国家秘密，但仍然按秘密对待
     case secret = 2        // 秘密★
     case confidential = 3  // 机密★
     case topSecret = 4     // 绝密★
@@ -67,11 +67,13 @@ enum SecretLevel: Int, Comparable {
         case .topSecret: return "绝密"
         case .confidential: return "机密"
         case .secret: return "秘密"
-        case .internalOnly: return "内部"
+        case .workSecret: return "工作秘密"
         case .info: return "提示"
         }
     }
     var isStateSecret: Bool { self.rawValue >= SecretLevel.secret.rawValue }
+    /// 口径：只有国家秘密与工作秘密进清单、参与脱密；内部资料与个人信息不再报
+    var isReportable: Bool { self.rawValue >= SecretLevel.workSecret.rawValue }
 
     static func < (a: SecretLevel, b: SecretLevel) -> Bool { a.rawValue < b.rawValue }
 }
@@ -156,26 +158,11 @@ enum OCR {
             let line = cand.string
             let ns = line as NSString
 
-            if let (level, _) = Confidential.classification(in: line), level.isStateSecret,
+            // 只认密级标志：图片里的证件号、手机号不再单独报，也不再遮盖
+            if let (level, _) = Confidential.classification(in: line), level.isReportable,
                let range = Range(NSRange(location: 0, length: ns.length), in: line),
                let box = try? cand.boundingBox(for: range) {
                 out.append(Hit(rect: box.boundingBox, text: line, level: level, kind: .classification))
-                continue
-            }
-            for (pattern, kind, level) in [
-                (#"[0-9]{17}[0-9Xx]"#, ConfKind.idCard, SecretLevel.info),
-                (#"[0-9]{16,19}"#, ConfKind.bankCard, SecretLevel.info),
-                (#"1[3-9][0-9]{9}"#, ConfKind.phone, SecretLevel.info),
-            ] {
-                guard let re = try? NSRegularExpression(pattern: pattern) else { continue }
-                for m in re.matches(in: line, range: NSRange(location: 0, length: ns.length)) {
-                    let token = ns.substring(with: m.range)
-                    let keep = kind == .idCard ? Confidential.isIdCard(token)
-                        : (kind == .bankCard ? Confidential.isBankCard(token) : true)
-                    guard keep, let range = Range(m.range, in: line),
-                          let box = try? cand.boundingBox(for: range) else { continue }
-                    out.append(Hit(rect: box.boundingBox, text: token, level: level, kind: kind))
-                }
             }
         }
         return out
@@ -530,7 +517,7 @@ enum OFD {
     }
 
     static func needsRedaction(_ text: String) -> Bool {
-        if let (level, _) = Confidential.classification(in: text), level.isStateSecret { return true }
+        if let (level, _) = Confidential.classification(in: text), level.isReportable { return true }
         for token in Confidential.matches(#"[0-9]{11,18}"#, in: text) {
             if Confidential.isIdCard(token) || Confidential.isBankCard(token) { return true }
             if token.count == 11 && token.hasPrefix("1") { return true }   // 手机号
@@ -631,7 +618,6 @@ enum Confidential {
         (.topSecret, #"绝\s*密"#),
         (.confidential, #"机\s*密"#),
         (.secret, #"秘\s*密"#),
-        (.internalOnly, #"工作秘密|内部资料|内部文件|内部使用|注意保密|仅限内部"#),
     ]
 
     /// 不该被读成密级的上下文：商业秘密、个人隐私、解密新闻
@@ -646,13 +632,25 @@ enum Confidential {
             let line = String(rawLine).trimmingCharacters(in: .whitespacesAndNewlines)
             guard !line.isEmpty, line.count <= 40 else { continue }
             if levelExceptions.contains(where: { line.contains($0) }) { continue }
+            // 工作秘密单独认：它含「秘密」二字，按国密规则会被误读成「秘密★」；
+            // 「内部资料 / 内部使用 / 注意保密」这类不再算任何等级
+            if line.contains("工作秘密") {
+                if best == nil { best = (.workSecret, "工作秘密") }
+                continue
+            }
             for (level, pattern) in levelRules {
                 guard let re = try? NSRegularExpression(pattern: pattern) else { continue }
                 let ns = line as NSString
                 guard let m = re.firstMatch(in: line, range: NSRange(location: 0, length: ns.length)) else { continue }
-                let markerish = ["★", "☆", "*", "期限", "密级", "级"].contains { line.contains($0) }
-                let atLineStart = m.range.location <= 6
+                // 卡的正是「标志」：带星号/期限/密级字样，或密级词就在行首 3 个字内；
+                // 不含这些标记、又带逗号句号的，是正文里的叙述（「绝密级公文应当如何管理」），不算
+                // 注意不能把「密级」放进标记词：它是「绝密级 / 机密级」的子串，
+                // 一放进去，正文里的「绝密级公文应当…」就又算成标志了
+                let markerish = ["★", "☆", "*", "期限"].contains { line.contains($0) }
+                let atLineStart = m.range.location <= 3
+                let prose = line.contains("，") || line.contains("。") || line.contains("；")
                 guard markerish || atLineStart else { continue }
+                if prose && !markerish { continue }
                 let matched = ns.substring(with: m.range)
                 if best == nil || level > best!.0 { best = (level, matched) }
             }
@@ -756,28 +754,6 @@ enum Confidential {
             return
         }
 
-        // 元数据：作者、最后保存人、修订次数（这几项在属性流里是明文）
-        if let si = CFB.stream(d, name: "\u{05}SummaryInformation") {
-            let info = PropertySet.parse(si)
-            for (value, label) in [(info.author, "作者"), (info.lastSavedBy, "最后保存人")] {
-                if let v = value, !v.isEmpty {
-                    r.findings.append(ConfFinding(kind: .author, file: rel, place: "文档属性·\(label)",
-                                                  value: v, note: "属性会跟着文件走", level: .info))
-                }
-            }
-            if let rev = info.revision, !rev.isEmpty, rev != "0" {
-                r.findings.append(ConfFinding(kind: .revision, file: rel, place: "修订次数",
-                                              value: rev, note: "文档被改过 \(rev) 次，历史内容可能仍在", level: .internalOnly))
-            }
-        }
-        if let dsi = CFB.stream(d, name: "\u{05}DocumentSummaryInformation") {
-            let info = PropertySet.parse(dsi)
-            if let v = info.company, !v.isEmpty {
-                r.findings.append(ConfFinding(kind: .author, file: rel, place: "文档属性·单位",
-                                              value: v, note: "属性会跟着文件走", level: .info))
-            }
-        }
-
         // 正文：二进制里找可见文字。能找到就报，找不到不代表没有。
         let textStreams = ["WordDocument", "Workbook", "Book", "PowerPoint Document"]
         var raw = Data()
@@ -866,26 +842,10 @@ enum Confidential {
             r.findings.append(ConfFinding(kind: .classification, file: file, place: place,
                                           value: matched,
                                           note: level.isStateSecret ? "文首出现国家秘密标志（\(level.label)）"
-                                                                    : "文首出现内部标识（不是国家秘密）",
+                                                                    : "文首出现工作秘密标志",
                                           level: level, viaOCR: viaOCR, context: ctx))
         }
-        let ns = text as NSString
-        let patterns: [(String, ConfKind, String, () -> Bool, (String) -> Bool)] = [
-            (#"(?<![0-9])[0-9]{17}[0-9Xx](?![0-9])"#, .idCard, "校验位通过（个人信息，不是密级）", { true }, isIdCard),
-            (#"(?<![0-9])[1-9][0-9]{15,18}(?![0-9])"#, .bankCard, "Luhn 校验通过（个人信息，不是密级）", { true }, isBankCard),
-            (#"(?<![0-9])1[3-9][0-9]{9}(?![0-9])"#, .phone, "11 位手机号（个人信息，不是密级）", { true }, { _ in true }),
-            (#"(?<![0-9A-Z])[0-9A-HJ-NPQRTUWXY]{18}(?![0-9A-Z])"#, .uscc, "校验位通过（单位代码，不是密级）", { true }, isUSCC),
-        ]
-        for (pattern, kind, note, _, validate) in patterns {
-            guard let re = try? NSRegularExpression(pattern: pattern) else { continue }
-            for m in re.matches(in: text, range: NSRange(location: 0, length: ns.length)) {
-                let token = ns.substring(with: m.range)
-                guard validate(token) else { continue }
-                r.findings.append(ConfFinding(kind: kind, file: file, place: place,
-                                              value: mask(token), note: note, level: .info,
-                                              viaOCR: viaOCR, context: snippet(text, at: m.range, token: token)))
-            }
-        }
+        // 证件号、手机号、统一社会信用代码一律不再报：口径只认国家秘密与工作秘密
     }
 
     static func matches(_ pattern: String, in text: String) -> [String] {
@@ -943,45 +903,14 @@ enum Confidential {
                                           value: "zip", note: "打不开（可能加密），内容未检查", level: .info))
             return
         }
-        if parts.contains(where: { $0.hasSuffix("vbaProject.bin") }) {
-            r.findings.append(ConfFinding(kind: .embed, file: rel, place: "VBA",
-                                          value: "宏", note: "含 VBA 宏，脱密不会清掉它", level: .info))
-        }
-        if parts.contains(where: { $0.contains("embeddings/") }) {
-            r.findings.append(ConfFinding(kind: .embed, file: rel, place: "embeddings",
-                                          value: "嵌入对象", note: "含嵌入对象，内外可能不止一层", level: .info))
-        }
-        if let core = zipMember(path, "docProps/core.xml") {
-            for (tag, label) in [("dc:creator", "作者"), ("cp:lastModifiedBy", "最后修改人")] {
-                if let v = firstTag(core, tag), !v.isEmpty {
-                    r.findings.append(ConfFinding(kind: .author, file: rel, place: label,
-                                                  value: v, note: "文档属性会跟着文件走", level: .info))
-                }
-            }
-        }
-        if let app = zipMember(path, "docProps/app.xml"), let v = firstTag(app, "Company"), !v.isEmpty {
-            r.findings.append(ConfFinding(kind: .author, file: rel, place: "单位",
-                                          value: v, note: "文档属性会跟着文件走", level: .info))
-        }
-
+        // 宏、嵌入对象、文档属性、修订、批注都不再单独报；
+        // 真正脱密时会连同这些一起清掉（见 Declass.cleanOOXML）
         let bodyParts = parts.filter { $0.hasSuffix(".xml") && (
             $0.hasPrefix("word/") || $0.hasPrefix("xl/") || $0.hasPrefix("ppt/")) }
-        var sawRevision = false, sawComment = false
         var text = ""
         for part in bodyParts.prefix(12) {
             guard let xml = zipMember(path, part) else { continue }
-            if !sawRevision && (xml.contains("<w:ins") || xml.contains("<w:del")) { sawRevision = true }
-            if !sawComment && part.contains("comments") { sawComment = true }
             if text.count < maxTextChars { text += stripXML(xml) }
-        }
-        if sawRevision {
-            r.findings.append(ConfFinding(kind: .revision, file: rel, place: "正文",
-                                          value: "修订记录", note: "保留修订时，被删的内容仍能从文件里取回",
-                                          level: .internalOnly))
-        }
-        if sawComment || parts.contains(where: { $0.contains("comments.xml") }) {
-            r.findings.append(ConfFinding(kind: .comment, file: rel, place: "批注",
-                                          value: "批注", note: "批注常含内部意见", level: .internalOnly))
         }
         scanText(text, file: rel, place: "正文", into: &r)
     }
@@ -1006,10 +935,6 @@ enum Confidential {
             r.findings.append(ConfFinding(kind: .unscannable, file: rel, place: "—",
                                           value: "ofd", note: "没有 OFD.xml，不是标准 OFD，内容未检查", level: .info))
             return
-        }
-        if OFD.hasSignature(u.path) {
-            r.findings.append(ConfFinding(kind: .embed, file: rel, place: "数字签名",
-                                          value: "已签章", note: "改动会让签章失效，脱密前请确认", level: .internalOnly))
         }
         let pages = OFD.pages(u.path)
         guard !pages.isEmpty else {
@@ -1055,14 +980,6 @@ enum Confidential {
                                           value: "pdf", note: "打不开（可能加密或损坏），内容未检查", level: .info))
             return
         }
-        let attrs = doc.documentAttributes ?? [:]
-        for key in [PDFDocumentAttribute.authorAttribute, .creatorAttribute] {
-            if let v = attrs[key] as? String, !v.isEmpty {
-                r.findings.append(ConfFinding(kind: .author, file: rel, place: "PDF 属性",
-                                              value: v, note: "PDF 会带着作者与生成工具", level: .info))
-            }
-        }
-
         var text = ""
         for i in 0..<min(doc.pageCount, 30) {
             if let p = doc.page(at: i)?.string { text += p + "\n" }
@@ -1091,40 +1008,18 @@ enum Confidential {
                                           value: "无文字层", note: "扫描件，未做 OCR，内容未检查", level: .info))
         }
 
-        if let d = try? Data(contentsOf: u), d.count <= maxFileBytes {
-            let s = String(decoding: d, as: UTF8.self)
-            if s.contains("/EmbeddedFile") {
-                r.findings.append(ConfFinding(kind: .embed, file: rel, place: "PDF 附件",
-                                              value: "嵌入文件", note: "附件里的内容不会被正文检查覆盖", level: .internalOnly))
-            }
-            if s.contains("/JavaScript") || s.contains("/OpenAction") {
-                r.findings.append(ConfFinding(kind: .embed, file: rel, place: "PDF 脚本",
-                                              value: "JavaScript", note: "文档带脚本，打开前请确认来源", level: .info))
-            }
-        }
     }
 
     // MARK: 图片（元数据 + OCR）
 
     static func inspectImage(_ u: URL, rel: String, ocr: Bool, into r: inout Result) {
         guard let src = CGImageSourceCreateWithURL(u as CFURL, nil),
-              let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any] else {
+              CGImageSourceCreateImageAtIndex(src, 0, nil) != nil else {
             r.findings.append(ConfFinding(kind: .unscannable, file: rel, place: "—",
-                                          value: "image", note: "读不出元数据，未检查", level: .info))
+                                          value: "image", note: "读不出图片，未检查", level: .info))
             return
         }
-        if let gps = props[kCGImagePropertyGPSDictionary] as? [CFString: Any], !gps.isEmpty {
-            r.findings.append(ConfFinding(kind: .exif, file: rel, place: "GPS",
-                                          value: "拍摄位置", note: "照片会暴露拍摄地点", level: .info))
-        }
-        if let tiff = props[kCGImagePropertyTIFFDictionary] as? [CFString: Any] {
-            for (k, label) in [(kCGImagePropertyTIFFMake, "相机厂商"), (kCGImagePropertyTIFFModel, "机型")] {
-                if let v = tiff[k] as? String, !v.isEmpty {
-                    r.findings.append(ConfFinding(kind: .exif, file: rel, place: label,
-                                                  value: v, note: "设备信息会跟着照片走", level: .info))
-                }
-            }
-        }
+        // 元数据里的拍摄地点、机型不再报
         if ocr {
             let t = OCR.text(fromImageAt: u)
             r.ocrPages += 1
@@ -1149,12 +1044,12 @@ extension Confidential.Result {
             let worst = state.map { $0.level }.max()!
             lines.append("国家秘密标志：**发现 \(worst.label)**（\(state.count) 处）")
         }
-        let notice = findings.filter { $0.level == .internalOnly }.count
+        let work = findings.filter { $0.level == .workSecret }.count
         let info = findings.filter { $0.level == .info }.count
-        lines.append("内部/工作秘密：\(notice) 处；其它提示（个人信息、元数据、未检查）：\(info) 处")
+        lines.append("工作秘密：\(work) 处；未检查（判不了内容）：\(info) 处")
         lines.append("")
         if findings.isEmpty {
-            lines.append("没有发现密级标志、证件号或文档痕迹。")
+            lines.append("没有发现国家秘密或工作秘密标志。")
             lines.append("注意：这只代表本次规则没命中，不等于这份材料可以对外提供。")
             return lines.joined(separator: "\n")
         }
@@ -1176,8 +1071,7 @@ extension Confidential.Result {
             lines.append("▸ \(g.file)")
             for f in g.items.sorted(by: { $0.level > $1.level }) {
                 guard printed < limit else { break }
-                let tag = f.level.isStateSecret ? "【\(f.level.label)】"
-                        : (f.level == .internalOnly ? "【内部】" : "【提示】")
+                let tag = f.level.isReportable ? "【\(f.level.label)】" : "【提示】"
                 let ocr = f.viaOCR ? "（OCR）" : ""
                 lines.append("   \(tag)\(f.kind.rawValue)  \(f.place)\(ocr)  \(f.value)  — \(f.note)")
                 printed += 1
@@ -1269,10 +1163,10 @@ enum Declass {
         out = lines.filter { line in
             let t = line.trimmingCharacters(in: .whitespaces)
             guard !t.isEmpty else { return true }
-            if let (level, _) = Confidential.classification(in: t), level.isStateSecret {
+            if let (level, _) = Confidential.classification(in: t), level.isReportable {
                 // 只删「标志行」：以标志开头且长度不长
                 let head = String(t.prefix(12))
-                if let (l2, _) = Confidential.classification(in: head), l2.isStateSecret, t.count <= 40 { return false }
+                if let (l2, _) = Confidential.classification(in: head), l2.isReportable, t.count <= 40 { return false }
             }
             return true
         }.joined(separator: "\n")
@@ -1387,7 +1281,7 @@ enum Declass {
         let ms = re.matches(in: xml, range: NSRange(location: 0, length: ns.length))
         for m in ms.reversed() {
             let snippet = ns.substring(with: m.range)
-            let inner = Confidential.classification(in: snippet).map { $0.0.isStateSecret } ?? false
+            let inner = Confidential.classification(in: snippet).map { $0.0.isReportable } ?? false
             let hasPII = Confidential.matches(#"[0-9]{11,19}"#, in: snippet).contains {
                 Confidential.isIdCard($0) || Confidential.isBankCard($0)
                     || ($0.count == 11 && $0.hasPrefix("1") && !"012".contains($0.dropFirst().first ?? "0"))
@@ -1397,7 +1291,8 @@ enum Declass {
             for p in [#"[0-9]{17}[0-9Xx]"#, #"[0-9]{16,19}"#, #"[0-9]{11}"#] {
                 replaced = replaced.replacingOccurrences(of: p, with: maskToken, options: .regularExpression)
             }
-            replaced = replaced.replacingOccurrences(of: "绝密", with: maskToken)
+            replaced = replaced.replacingOccurrences(of: "工作秘密", with: maskToken)
+                .replacingOccurrences(of: "绝密", with: maskToken)
                 .replacingOccurrences(of: "机密", with: maskToken)
                 .replacingOccurrences(of: "秘密", with: maskToken)
             result = (result as NSString).replacingCharacters(in: m.range, with: replaced)
@@ -1643,8 +1538,8 @@ enum Declass {
 
         var before = Confidential.Result()
         Confidential.inspectFileForCLI(u, ocr: ocr, into: &before)
-        let beforeCritical = before.findings.filter { $0.kind != .unscannable }
-        if beforeCritical.isEmpty { return ([], "该文件当前没有需要处理的内容") }
+        let beforeCritical = before.findings.filter { $0.kind == .classification && $0.level.isReportable }
+        if beforeCritical.isEmpty { return ([], "该文件没有国家秘密或工作秘密标志，无需脱密") }
 
         var actions: [String] = []
         switch ext {
@@ -1670,12 +1565,7 @@ enum Declass {
         // 复检：原来命中的类别必须消失，否则不给「已脱密」这个结论
         var after = Confidential.Result()
         Confidential.inspectFileForCLI(dst, ocr: ocr, into: &after)
-        let still = after.findings.filter { f in
-            let same = beforeCritical.filter { $0.kind == f.kind }
-            guard let worst = same.map({ $0.level }).max() else { return false }
-            if f.kind == .classification { return f.level.isStateSecret }
-            return f.level >= min(worst, .internalOnly)
-        }
+        let still = after.findings.filter { $0.kind == .classification && $0.level.isReportable }
         if !still.isEmpty {
             return (actions, "复检没过：" + still.map { $0.kind.rawValue }.joined(separator: "、") + " 仍在")
         }
