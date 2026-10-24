@@ -1244,6 +1244,20 @@ enum Declass {
                     if !actions.contains("接受修订") { actions.append("接受修订") }
                 }
                 xml = xml.replacingOccurrences(of: "<w:commentReference[^>]*/>", with: "", options: .regularExpression)
+                // 密级标志独占一段时整段删掉；段里还有正文就退回遮盖（见 stripMarkerParagraphs）
+                if part.hasPrefix("word/") {
+                    let (x, n) = stripMarkerParagraphs(xml, openTag: "w:p", textTag: "w:t")
+                    if n > 0 {
+                        xml = x
+                        if !actions.contains("整段删除密级标志") { actions.append("整段删除密级标志") }
+                    }
+                } else if part.hasPrefix("ppt/") {
+                    let (x, n) = stripMarkerParagraphs(xml, openTag: "a:p", textTag: "a:t")
+                    if n > 0 {
+                        xml = x
+                        if !actions.contains("整段删除密级标志") { actions.append("整段删除密级标志") }
+                    }
+                }
                 for (open, close) in [("<w:t", "</w:t>"), ("<a:t>", "</a:t>"), ("<t>", "</t>")] {
                     xml = maskInXMLText(xml, open: open, close: close)
                 }
@@ -1271,6 +1285,92 @@ enum Declass {
             return (actions, "重打包后成员不一致（\(after.count)/\(parts.count)）")
         }
         return (actions, nil)
+    }
+
+    /// 段落里的纯文字（把该段所有文本节点拼起来）
+    static func paragraphText(_ snippet: String, textTag: String) -> String {
+        guard let re = try? NSRegularExpression(
+            pattern: "<\(textTag)[^>]*>([^<]*)</\(textTag)>") else { return "" }
+        let ns = snippet as NSString
+        let parts = re.matches(in: snippet, range: NSRange(location: 0, length: ns.length))
+            .map { ns.substring(with: $0.range(at: 1)) }
+        return parts.joined()
+    }
+
+    /// 只留下「标志」的段落：长度很短，且去掉标志、星号、期限短语之后基本没有别的内容
+    static func isMarkerParagraph(_ text: String) -> Bool {
+        let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !t.isEmpty, t.count <= 40 else { return false }
+        guard let (level, _) = Confidential.classification(in: t), level.isReportable else { return false }
+        var rest = t
+        for pattern in [#"[★☆*]"#, #"(绝\s*密|机\s*密|秘\s*密|工作秘密)"#,
+                        #"保\s*密\s*期\s*限\s*[0-9〇一二三四五六七八九十]+\s*年?"#,
+                        #"[\s:：·—\-（）()\[\]【】]"#] {
+            rest = rest.replacingOccurrences(of: pattern, with: "", options: .regularExpression)
+        }
+        return rest.count <= 2
+    }
+
+    /// 删掉只装密级标志的整段。要动段落结构，所以只在「这段除了标志没别的」时动手；
+    /// 段落里还有正文时保持原样，交给 maskInXMLText 遮盖
+    static func stripMarkerParagraphs(_ xml: String, openTag: String, textTag: String) -> (String, Int) {
+        let ns = xml as NSString
+        let n = ns.length
+        let closeTag = "</\(openTag)>"
+        var paragraphs: [NSRange] = []
+        var stack: [Int] = []
+        var i = 0
+        while i < n {
+            let rest = NSRange(location: i, length: n - i)
+            let nx = ns.range(of: "<\(openTag)", options: [], range: rest)
+            let nc = ns.range(of: closeTag, options: [], range: rest)
+            if nc.location == NSNotFound { break }
+
+            // "<w:p" 也会命中 "<w:pPr"：只有紧跟 > / 空格 / 斜杠的才算段落开头
+            var opening: Int? = nil
+            if nx.location != NSNotFound && nx.location < nc.location {
+                let afterName = nx.location + nx.length
+                if afterName < n {
+                    let c = ns.substring(with: NSRange(location: afterName, length: 1))
+                    if [">", " ", "/", "\n", "\t", "\r"].contains(c) { opening = nx.location }
+                }
+            }
+            guard let start = opening else {
+                if nx.location != NSNotFound && nx.location < nc.location {
+                    i = nx.location + nx.length     // 不是段落开头，跳过去继续
+                } else {
+                    let end = nc.location + nc.length
+                    if let start = stack.popLast() {
+                        paragraphs.append(NSRange(location: start, length: end - start))
+                    }
+                    i = end
+                }
+                continue
+            }
+
+            let tagEnd = ns.range(of: ">", options: [],
+                                  range: NSRange(location: start, length: n - start)).location
+            guard tagEnd != NSNotFound else { break }
+            let selfClosing = tagEnd > start
+                && ns.substring(with: NSRange(location: tagEnd - 1, length: 1)) == "/"
+            if !selfClosing { stack.append(start) }      // <w:p/> 不占栈
+            i = tagEnd + 1
+        }
+        guard !paragraphs.isEmpty else { return (xml, 0) }
+
+        let ns2 = xml as NSString
+        var result = xml
+        var removed = 0
+        var removedRanges: [NSRange] = []
+        // 从后往前删，前面的下标才不会串；被外层段落包住的不再单独处理
+        for range in paragraphs.sorted(by: { $0.location > $1.location }) {
+            if removedRanges.contains(where: { NSIntersectionRange($0, range).length > 0 }) { continue }
+            guard isMarkerParagraph(paragraphText(ns2.substring(with: range), textTag: textTag)) else { continue }
+            result = (result as NSString).replacingCharacters(in: range, with: "")
+            removedRanges.append(range)
+            removed += 1
+        }
+        return (result, removed)
     }
 
     static func maskInXMLText(_ xml: String, open: String, close: String) -> String {
