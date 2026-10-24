@@ -785,27 +785,39 @@ enum Confidential {
             if let s = CFB.stream(d, name: name) { raw.append(s) }
         }
         if raw.isEmpty { raw = d }
-        var found = false
-        // 二进制里解码失败是常态，用容错解码，不能用 String(data:encoding:) 那种一有坏字节就返回 nil 的
-        let utf16Text = decodeUTF16(raw)
-        let before0 = r.findings.count
-        scanText(utf16Text, file: rel, place: "二进制正文（位置未定位）", into: &r)
-        if r.findings.count > before0 { found = true }
-        if let t = String(data: raw, encoding: .utf8) {
-            let before = r.findings.count
-            scanText(t, file: rel, place: "二进制正文（位置未定位）", into: &r)
-            if r.findings.count > before { found = true }
+
+        // 旧版 Office / WPS 的正文夹在二进制里，直接解码得到的是碎片、行界也乱了，
+        // 密级标志（要求独占一行）会漏判。有 textutil 就先让它给一份干净正文。
+        if let t = textutilText(u), textCJKCount(Data(t.utf8)) >= 8 {
+            scanText(t, file: rel, place: "正文", into: &r)
+            r.scannedTextFiles += 1
+            return
         }
 
-        let cjk = textCJKCount(raw)
-        if cjk < 30 {
+        // 没有 textutil 可用时退回容错解码（一有坏字节就 nil 的 String(data:encoding:) 不能用）
+        scanText(decodeUTF16(raw), file: rel, place: "二进制正文（位置未定位）", into: &r)
+        if let t = String(data: raw, encoding: .utf8) {
+            scanText(t, file: rel, place: "二进制正文（位置未定位）", into: &r)
+        }
+        if textCJKCount(raw) < 8 {
             r.findings.append(ConfFinding(kind: .unscannable, file: rel, place: "二进制",
                                           value: "未取到正文", note: "没能从二进制里取到足够文字（可能是图片或特殊编码），需人工确认",
                                           level: .info))
-        } else if !found {
-            // 取到正文且没有命中：这一条不写成 finding，由摘要体现
+        } else {
+            // 取到正文；命中已在上面报过，没有命中就由摘要体现
             r.scannedTextFiles += 1
         }
+    }
+
+    /// 让系统 textutil 把旧格式正文转成纯文本（不依赖 LibreOffice）
+    static func textutilText(_ u: URL) -> String? {
+        var isDir: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: u.path, isDirectory: &isDir), !isDir.boolValue,
+              let size = (try? u.resourceValues(forKeys: [.fileSizeKey]).fileSize), size < 60_000_000 else { return nil }
+        let r = Shell.run("/usr/bin/textutil", ["-convert", "txt", "-stdout", u.path], timeout: 30)
+        guard r.ok else { return nil }
+        let t = r.out
+        return t.isEmpty ? nil : t
     }
 
     /// 容错解码：二进制里总会有坏字节，不能因为一个坏代理项就把整段文字丢掉
@@ -1376,8 +1388,9 @@ enum Declass {
         for m in ms.reversed() {
             let snippet = ns.substring(with: m.range)
             let inner = Confidential.classification(in: snippet).map { $0.0.isStateSecret } ?? false
-            let hasPII = [Confidential.matches(#"[0-9]{11,18}"#, in: snippet)].flatMap { $0 }.contains {
+            let hasPII = Confidential.matches(#"[0-9]{11,19}"#, in: snippet).contains {
                 Confidential.isIdCard($0) || Confidential.isBankCard($0)
+                    || ($0.count == 11 && $0.hasPrefix("1") && !"012".contains($0.dropFirst().first ?? "0"))
             }
             guard inner || hasPII || snippet.contains("绝密") || snippet.contains("机密") || snippet.contains("秘密") else { continue }
             var replaced = snippet
@@ -1669,6 +1682,21 @@ enum Declass {
         return (actions, nil)
     }
 
+    /// 原目录里挑一个不撞名的落点：已有同名副本（上次的脱密结果）就换名，绝不覆盖
+    static func freeURL(in dir: URL, preferred: URL) -> URL {
+        if !FileManager.default.fileExists(atPath: preferred.path) { return preferred }
+        let stem = preferred.deletingPathExtension().lastPathComponent
+        let ext = preferred.pathExtension
+        var n = 1
+        while n <= 99 {
+            let name = ext.isEmpty ? "\(stem) (脱密 \(n))" : "\(stem) (脱密 \(n)).\(ext)"
+            let candidate = dir.appendingPathComponent(name)
+            if !FileManager.default.fileExists(atPath: candidate.path) { return candidate }
+            n += 1
+        }
+        return dir.appendingPathComponent(UUID().uuidString + (ext.isEmpty ? "" : "." + ext))
+    }
+
     /// 处理一个文件：产出干净副本（必要时先转格式）→ 复检 → 原件进回收目录 → 副本回原位
     static func apply(file u: URL, ocr: Bool, trashDir: URL) -> Outcome {
         var out = Outcome(file: u.lastPathComponent)
@@ -1703,13 +1731,9 @@ enum Declass {
             return out
         }
 
-        var finalURL = u
-        if cleanURL.lastPathComponent != u.lastPathComponent {
-            finalURL = dir.appendingPathComponent(cleanURL.lastPathComponent)
-            if FileManager.default.fileExists(atPath: finalURL.path) {
-                finalURL = dir.appendingPathComponent(
-                    cleanURL.deletingPathExtension().lastPathComponent + " (脱密)." + cleanURL.pathExtension)
-            }
+        let preferred = dir.appendingPathComponent(cleanURL.lastPathComponent)
+        let finalURL = freeURL(in: dir, preferred: preferred)
+        if finalURL.lastPathComponent != u.lastPathComponent {
             out.newFile = finalURL.lastPathComponent
         }
         do {
