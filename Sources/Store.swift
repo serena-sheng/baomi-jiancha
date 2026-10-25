@@ -57,6 +57,16 @@ final class Store {
             exec("ALTER TABLE findings ADD COLUMN muted INTEGER NOT NULL DEFAULT 0;")
         }
         exec("CREATE INDEX IF NOT EXISTS idx_find_muted ON findings(muted, level DESC);")
+        // 「这不是涉密」：用户否证过一次的判断。键带 size+mtime+口径版本，
+        // 文件一被改写、口径一换代，这个否证就自动失效——不然它会变成永久失明。
+        exec("""
+        CREATE TABLE IF NOT EXISTS dismissals(
+          path TEXT PRIMARY KEY,
+          size INTEGER NOT NULL,
+          mtime REAL NOT NULL,
+          rules TEXT NOT NULL,
+          at REAL NOT NULL);
+        """)
         // 口径收紧：只留「密级标志」里的国家秘密 / 工作秘密，加「无法检查」。
         // 旧版本留下的内部资料、证件号、文档属性、修订、批注、照片位置等记录一次清掉，
         // 否则它们会以新标签重新出现在清单里
@@ -254,9 +264,16 @@ final class Store {
         var st: OpaquePointer?
         defer { sqlite3_finalize(st) }
         let whereMuted = suppressedOnly ? "muted>0" : "muted=0"
-        guard sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM findings WHERE level >= ?1 AND \(whereMuted)",
-                                 -1, &st, nil) == SQLITE_OK else { return 0 }
+        let sql = """
+        SELECT COUNT(*) FROM findings f
+        LEFT JOIN files fl ON fl.path = f.path
+        LEFT JOIN dismissals d ON d.path = f.path AND d.rules = ?2
+             AND d.size = fl.size AND abs(d.mtime - fl.mtime) < 0.001
+        WHERE f.level >= ?1 AND f.\(whereMuted) AND d.path IS NULL
+        """
+        guard sqlite3_prepare_v2(db, sql, -1, &st, nil) == SQLITE_OK else { return 0 }
         sqlite3_bind_int(st, 1, Int32(minLevel))
+        bind(st, 2, Self.rulesVersion)
         guard
               sqlite3_step(st) == SQLITE_ROW else { return 0 }
         return Int(sqlite3_column_int(st, 0))
@@ -269,14 +286,19 @@ final class Store {
         var st: OpaquePointer?
         defer { sqlite3_finalize(st) }
         let whereMuted = suppressedOnly ? "muted>0" : "muted=0"
-        guard sqlite3_prepare_v2(db, """
-        SELECT path,kind,level,place,value,note,ctx FROM findings
-        WHERE level >= ?3 AND \(whereMuted)
-        ORDER BY level DESC, found_at DESC LIMIT ?1 OFFSET ?2
-        """, -1, &st, nil) == SQLITE_OK else { return out }
+        let sql = """
+        SELECT f.path,f.kind,f.level,f.place,f.value,f.note,f.ctx FROM findings f
+        LEFT JOIN files fl ON fl.path = f.path
+        LEFT JOIN dismissals d ON d.path = f.path AND d.rules = ?4
+             AND d.size = fl.size AND abs(d.mtime - fl.mtime) < 0.001
+        WHERE f.level >= ?3 AND f.\(whereMuted) AND d.path IS NULL
+        ORDER BY f.level DESC, f.found_at DESC LIMIT ?1 OFFSET ?2
+        """
+        guard sqlite3_prepare_v2(db, sql, -1, &st, nil) == SQLITE_OK else { return out }
         sqlite3_bind_int(st, 1, Int32(limit))
         sqlite3_bind_int(st, 2, Int32(offset))
         sqlite3_bind_int(st, 3, Int32(minLevel))
+        bind(st, 4, Self.rulesVersion)
         while sqlite3_step(st) == SQLITE_ROW {
             out.append(Row(path: text(st, 0), kind: text(st, 1), level: Int(sqlite3_column_int(st, 2)),
                            place: text(st, 3), value: text(st, 4), note: text(st, 5), ctx: text(st, 6)))
@@ -554,4 +576,60 @@ extension Store {
         guard sqlite3_step(st) == SQLITE_ROW else { return nil }
         return text(st, 0)
     }
+    // MARK: - 「这不是涉密」
+    //
+    // 机器的怀疑必须能被用户否证，且否证要记住——但只在文件没变、口径没变时记住。
+    // 键 = path + size + mtime + rulesVersion：任一变化即自动失效，避免否证变成永久失明。
+
+    func addDismissal(path: String) {
+        lock.lock(); defer { lock.unlock() }
+        var size = 0, mtime = 0.0
+        var st: OpaquePointer?
+        if sqlite3_prepare_v2(db, "SELECT size, mtime FROM files WHERE path=?1", -1, &st, nil) == SQLITE_OK {
+            bind(st, 1, path)
+            if sqlite3_step(st) == SQLITE_ROW {
+                size = Int(sqlite3_column_int64(st, 0))
+                mtime = sqlite3_column_double(st, 1)
+            }
+        }
+        sqlite3_finalize(st)
+        if size == 0 && mtime == 0 {
+            // files 里没有就现读，别把 size=0 写进去——那会让校验永远对不上
+            if let a = try? FileManager.default.attributesOfItem(atPath: path) {
+                size = Int((a[.size] as? Int64) ?? 0)
+                mtime = (a[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
+            }
+        }
+        run("""
+        INSERT INTO dismissals(path,size,mtime,rules,at) VALUES(?1,?2,?3,?4,?5)
+        ON CONFLICT(path) DO UPDATE SET size=?2, mtime=?3, rules=?4, at=?5
+        """, [path, size, mtime, Self.rulesVersion, Date().timeIntervalSince1970])
+    }
+
+    func removeDismissal(path: String) {
+        lock.lock(); defer { lock.unlock() }
+        run("DELETE FROM dismissals WHERE path=?1", [path])
+    }
+
+    func clearDismissals() {
+        lock.lock(); defer { lock.unlock() }
+        run("DELETE FROM dismissals", [])
+    }
+
+    /// 当前仍生效的否证条数（口径换代或文件改动之后，旧的自然不计数）
+    func dismissalCount() -> Int {
+        lock.lock(); defer { lock.unlock() }
+        var st: OpaquePointer?
+        defer { sqlite3_finalize(st) }
+        let sql = """
+        SELECT COUNT(*) FROM dismissals d
+        LEFT JOIN files fl ON fl.path = d.path
+        WHERE d.rules = ?1 AND (fl.path IS NULL OR (d.size = fl.size AND abs(d.mtime - fl.mtime) < 0.001))
+        """
+        guard sqlite3_prepare_v2(db, sql, -1, &st, nil) == SQLITE_OK else { return 0 }
+        bind(st, 1, Self.rulesVersion)
+        guard sqlite3_step(st) == SQLITE_ROW else { return 0 }
+        return Int(sqlite3_column_int(st, 0))
+    }
+
 }

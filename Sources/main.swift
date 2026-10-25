@@ -415,6 +415,8 @@ final class Model: ObservableObject {
     @Published var files = 0
     /// 被「不报」规则压住的条数：不叫人，但要让用户知道系统看见过
     @Published var suppressed = 0
+    /// 被用户否证（「这不是涉密」）且仍然有效的条数
+    @Published var dismissed = 0
     @Published var onlySuppressed = false
     @Published var scanning = false
     @Published var scanned = 0
@@ -485,6 +487,7 @@ struct RowView: View {
     var onToggle: () -> Void
     var onProcess: () -> Void
     var onReveal: () -> Void
+    var onDismiss: () -> Void
     var onUndo: () -> Void
     var onRetry: () -> Void
     @State private var hovering = false
@@ -518,6 +521,18 @@ struct RowView: View {
             }
             .buttonStyle(.plain)
             .help("在访达中显示（⇧⌘R）")
+
+            if level.isReportable {
+                Button { onDismiss() } label: {
+                    Image(systemName: "hand.raised")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(hovering ? T.ink2 : T.ink3)
+                        .frame(width: 20, height: 20)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help("这不是涉密：记住这次判断，文件改过或口径换代后会重新报")
+            }
         }
     }
     private var isSecret: Bool { level.isStateSecret }
@@ -606,6 +621,7 @@ struct MainView: View {
     var onScan: () -> Void
     var onStop: () -> Void
     var onReveal: (String) -> Void
+    var onDismiss: (String) -> Void
     var onOpenSettings: () -> Void
     var onToggle: (String) -> Void
     var onProcess: ([String]) -> Void
@@ -618,6 +634,7 @@ struct MainView: View {
     var onRetry: (String) -> Void
     var onToggleFilter: () -> Void
     var onToggleSuppressed: () -> Void
+    var onClearDismissals: () -> Void
     /// 离屏预览时不用 ScrollView（它渲染不出来）
     var preview = false
 
@@ -823,6 +840,7 @@ struct MainView: View {
                         onToggle: { onToggle(row.path) },
                         onProcess: { onProcess([row.path]) },
                         onReveal: { onReveal(row.path) },
+                        onDismiss: { onDismiss(row.path) },
                         onUndo: { onUndo(row.path) },
                         onRetry: { onProcess([row.path]) })
                     .contentShape(Rectangle())
@@ -845,6 +863,9 @@ struct MainView: View {
                     .keyboardShortcut("r", modifiers: .command)
             }
             JPButton(title: model.onlySecrets ? "只看国家秘密 ✓" : "只看国家秘密", kind: .ghost) { onToggleFilter() }
+            if model.dismissed > 0 {
+                JPButton(title: "已排除 \(model.dismissed) 条 · 恢复", kind: .ghost) { onClearDismissals() }
+            }
             if !model.rows.isEmpty {
                 JPButton(title: "全选本页", kind: .ghost) { onSelectPage() }
                     .keyboardShortcut("a", modifiers: .command)
@@ -893,8 +914,10 @@ final class WindowController {
     var onPage: ((Int) -> Void)?
     var onSelectPage: (() -> Void)?
     var onRetry: ((String) -> Void)?
+    var onDismiss: ((String) -> Void)?
     var onToggleFilter: (() -> Void)?
     var onToggleSuppressed: (() -> Void)?
+    var onClearDismissals: (() -> Void)?
 
     init(model: Model, scanner: Scanner, store: Store) {
         self.model = model
@@ -910,6 +933,7 @@ final class WindowController {
                                 onReveal: { path in
                                     NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
                                 },
+                                  onDismiss: { [weak self] p in self?.onDismiss?(p) },
                                 onOpenSettings: {
                                     let urls = ["x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles"]
                                     if let u = urls.compactMap(URL.init(string:)).first {
@@ -926,7 +950,8 @@ final class WindowController {
                                 onSelectPage: { [weak self] in self?.onSelectPage?() },
                                 onRetry: { [weak self] p in self?.onRetry?(p) },
                                 onToggleFilter: { [weak self] in self?.onToggleFilter?() },
-                                onToggleSuppressed: { [weak self] in self?.onToggleSuppressed?() })
+                                onToggleSuppressed: { [weak self] in self?.onToggleSuppressed?() },
+                                onClearDismissals: { [weak self] in self?.onClearDismissals?() })
             let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 600, height: 560),
                              styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
                              backing: .buffered, defer: false)
@@ -1121,6 +1146,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let onlySupp = self.model.onlySuppressed
             let total = self.store.findingsCount(minLevel: minLevel, suppressedOnly: onlySupp)
             let supp = self.store.suppressedCount()
+            let dism = self.store.dismissalCount()
             let page = min(self.model.page, max(0, Int(ceil(Double(total) / Double(self.model.pageSize))) - 1))
             let rows = scanning ? self.model.rows
                                 : self.store.findings(limit: self.model.pageSize,
@@ -1131,6 +1157,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.model.totalHits = total
                 self.apply(c: c, rows: rows)
                 self.model.suppressed = supp
+                self.model.dismissed = dism
                 self.refreshing = false
             }
         }
@@ -1648,11 +1675,11 @@ if args.first == "--preview" {
         for (name, m) in cases {
             for scheme in [ColorScheme.light, .dark] {
                 let view = MainView(model: m, onScan: {}, onStop: {}, onReveal: { _ in },
-                                    onOpenSettings: {}, onToggle: { _ in }, onProcess: { _ in },
+                                    onDismiss: { _ in }, onOpenSettings: {}, onToggle: { _ in }, onProcess: { _ in },
                                     onSelectAll: { _ in }, onOpenTrash: {},
                                     onUndo: { _ in }, onStopProcessing: {},
                                     onPage: { _ in }, onSelectPage: {}, onRetry: { _ in },
-                                    onToggleFilter: {}, onToggleSuppressed: {},
+                                    onToggleFilter: {}, onToggleSuppressed: {}, onClearDismissals: {},
                                     preview: true)
                     .frame(width: 600, height: 560)
                     .environment(\.colorScheme, scheme)
