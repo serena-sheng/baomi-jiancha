@@ -7,6 +7,7 @@ OUT="build"
 APP="$OUT/${NAME}.app"
 cd "$(dirname "$0")"
 
+test -f Sources/Design.swift || { echo "! Sources/Design.swift 断链：它指向 ../jingpan/Sources/Design.swift"; exit 1; }
 echo "→ 编译"
 mkdir -p "$OUT"
 swiftc -O Sources/*.swift -o "$OUT/$BIN" \
