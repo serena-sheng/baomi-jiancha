@@ -310,7 +310,18 @@ final class Store {
         lock.lock(); defer { lock.unlock() }
         var secret = 0, work = 0, info = 0, files = 0
         var st: OpaquePointer?
-        if sqlite3_prepare_v2(db, "SELECT level, COUNT(*) FROM findings WHERE muted=0 GROUP BY level", -1, &st, nil) == SQLITE_OK {
+        // 计数必须和清单同一口径：漏了 dismissals 的 JOIN，会出现
+        // 「行消失了、表头数字还在」——那比不消失更让人怀疑
+        let sql = """
+        SELECT f.level, COUNT(*) FROM findings f
+        LEFT JOIN files fl ON fl.path = f.path
+        LEFT JOIN dismissals d ON d.path = f.path AND d.rules = ?1
+             AND d.size = fl.size AND abs(d.mtime - fl.mtime) < 0.001
+        WHERE f.muted = 0 AND d.path IS NULL
+        GROUP BY f.level
+        """
+        if sqlite3_prepare_v2(db, sql, -1, &st, nil) == SQLITE_OK {
+            bind(st, 1, Self.rulesVersion)
             while sqlite3_step(st) == SQLITE_ROW {
                 let level = Int(sqlite3_column_int(st, 0))
                 let n = Int(sqlite3_column_int(st, 1))
