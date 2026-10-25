@@ -20,7 +20,7 @@ enum T {
     static let ink3   = dyn(0x67676F, 0xA0A0A6)   // 深色由 #949499 提到 4.6:1 以上
     static let hair   = dyn(0x000000, 0xFFFFFF, 0.08)
     static let track  = dyn(0x000000, 0xFFFFFF, 0.06)
-    static let accent = dyn(0x0066CC, 0x0A84FF)
+    static let accent = dyn(0x0066CC, 0x0A6FD8)   // 深色原本 #0A84FF，白字只有 3.65:1；#0A6FD8 = 4.91:1
     static let ok     = dyn(0x1B7A34, 0x32D74B)
     static let warn   = dyn(0xB25000, 0xFF9F0A)
 
@@ -61,12 +61,31 @@ struct JPDot: View {
 struct JPBar: View {
     var value: Double
     var tint: Color = T.accent
+    /// 总量未知（扫描期）：扫光往返，不伪造百分比
+    var indeterminate = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
     var body: some View {
         GeometryReader { g in
             ZStack(alignment: .leading) {
                 Capsule().fill(T.track)
-                Capsule().fill(tint)
-                    .frame(width: max(0, min(1, value)) * g.size.width)
+                if indeterminate {
+                    if reduceMotion {
+                        Capsule().fill(tint.opacity(0.55)).frame(width: g.size.width * 0.3)
+                    } else {
+                        TimelineView(.animation(minimumInterval: 1.0 / 60.0)) { ctx in
+                            let t = ctx.date.timeIntervalSinceReferenceDate
+                            let phase = (t.truncatingRemainder(dividingBy: 1.2)) / 1.2
+                            Capsule().fill(tint.opacity(0.7))
+                                .frame(width: max(24, g.size.width * 0.28))
+                                .offset(x: (g.size.width + 40) * CGFloat(phase) - 40)
+                        }
+                    }
+                } else {
+                    Capsule().fill(tint)
+                        .frame(width: max(0, min(1, value)) * g.size.width)
+                        .animation(.easeOut(duration: 0.18), value: value)
+                }
             }
         }
         .frame(height: T.barH)

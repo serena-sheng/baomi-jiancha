@@ -625,7 +625,7 @@ struct MainView: View {
 
             if model.scanning {
                 if model.total == 0 {
-                    JPBar(value: 0.28, tint: T.ink3).padding(.top, 2)
+                    JPBar(value: 0, indeterminate: true).padding(.top, 2)
                 } else {
                     JPBar(value: progress).padding(.top, 2)
                 }
@@ -1012,7 +1012,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let menu = NSMenu()
 
         let state = NSMenuItem(title: scanner.scanning
-                               ? "正在扫描 \(scanner.scanned)/\(scanner.total)"
+                               ? (scanner.total > 0 ? "正在扫描 \(scanner.scanned)/\(scanner.total)"
+                                                    : "正在扫描 · 已看 \(scanner.scanned) 个，总量还在数")
                                : "空闲 · 已索引 \(c.files) 个文件", action: nil, keyEquivalent: "")
         state.isEnabled = false
         menu.addItem(state)
