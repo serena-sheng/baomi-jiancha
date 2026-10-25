@@ -51,6 +51,8 @@ final class Store {
         exec("CREATE INDEX IF NOT EXISTS idx_supp_enabled ON suppressions(enabled, scope);")
         // 早期版本把 nil 写成 -1，规则会永远匹配不上；顺手清一遍
         exec("UPDATE suppressions SET via_ocr=NULL WHERE via_ocr<0;")
+        // 早期默认种过一条「~/dev 整目录」规则，会把开发者导出的真涉密文件一起静音，删掉
+        exec("DELETE FROM suppressions WHERE scope='dir' AND note LIKE '%源码目录%';")
         if !hasColumn("findings", "muted") {
             exec("ALTER TABLE findings ADD COLUMN muted INTEGER NOT NULL DEFAULT 0;")
         }
@@ -68,6 +70,16 @@ final class Store {
             exec("DELETE FROM files;")
             setMeta("rulesVersion", Self.rulesVersion)
             Log.w("store: 判定规则换代（\(Self.rulesVersion)），索引已清空，等一次全量重扫")
+        }
+
+        // 默认规则集换代：只替换我们自己种下的那几条，用户自建的原样保留
+        if meta("suppressVersion") != "2" {
+            exec("""
+            DELETE FROM suppressions
+            WHERE note LIKE '%源码目录%' OR note LIKE '%画面内容%' OR note = '同 .png'
+            """)
+            exec("DELETE FROM meta WHERE key='suppressSeeded'")
+            setMeta("suppressVersion", "2")
         }
 
         // 抑制规则是用户意图，不随判定口径换代清空；命中状态要跟着当前库重算一次
@@ -431,13 +443,16 @@ extension Store {
         lock.unlock()
         guard !seeded, existing.isEmpty else { return }
 
-        let dev = NSHomeDirectory() + "/dev"
+        // 不用「整个目录」规则：~/dev 下也可能有真的涉密导出文件，
+        // 整目录一压就等于给开发者开了后门。只压「图片里 OCR 出来的秘密/机密」：
+        // 那是画面内容，不是文件自身的密级标志；绝密仍由红线兜住。
         let rules: [(String, String, Int?, Int, Int, String)] = [
-            ("dir", dev, nil, 2, 4, "源码目录只放示例文档，真实涉密原件不会落在这里"),
-            ("suffix", ".png", 1, 2, 2, "截图画面里的密级字样是画面内容，不是文件自身的标志"),
-            ("suffix", ".jpg", 1, 2, 2, "同 .png"),
-            ("suffix", ".jpeg", 1, 2, 2, "同 .png"),
-            ("suffix", ".heic", 1, 2, 2, "同 .png"),
+            ("suffix", ".png", 1, 2, 3, "截图画面里的密级字样是画面内容，不是文件自身的标志"),
+            ("suffix", ".jpg", 1, 2, 3, "同 .png"),
+            ("suffix", ".jpeg", 1, 2, 3, "同 .png"),
+            ("suffix", ".heic", 1, 2, 3, "同 .png"),
+            ("suffix", ".tif", 1, 2, 3, "同 .png"),
+            ("suffix", ".tiff", 1, 2, 3, "同 .png"),
         ]
         for r in rules {
             addSuppression(scope: r.0, pattern: r.1, viaOCR: r.2,
@@ -460,6 +475,9 @@ extension Store {
 /// 抽成 file-scope 函数是因为命令行 `--scan` 也要用同一套口径，
 /// 否则窗口说「干净」、命令行说「33 处命中」，等于一份事实两处实现。
 func suppressionMode(path: String, level: Int, ocr: Int, rules: [Suppression]) -> Int {
+    // 红线：绝密（level 4）不可抑制。写在这里而不是只靠规则的 max_level，
+    // 是因为规则可以被改成 4，而这条不该被任何配置绕过。
+    if level >= 4 { return 0 }
     var best: Suppression?
     for r in rules {
         guard level >= r.minLevel, level <= r.maxLevel else { continue }

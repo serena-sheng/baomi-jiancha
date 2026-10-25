@@ -28,6 +28,17 @@ enum Log {
 // MARK: - 通知
 
 enum Notifier {
+    private static var asked = false
+
+    /// 不申请授权就 post，系统会静默丢弃——用户永远不知道自己被叫过
+    static func requestIfNeeded() {
+        guard !asked else { return }
+        asked = true
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { ok, err in
+            Log.w("notify: 授权=\(ok) err=\(err?.localizedDescription ?? "-")")
+        }
+    }
+
     static func post(title: String, body: String) {
         let c = UNMutableNotificationContent()
         c.title = title
@@ -965,6 +976,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         winMenu.addItem(NSMenuItem(title: "最小化", action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m"))
         winItem.submenu = winMenu
         NSApp.mainMenu = main
+        Notifier.requestIfNeeded()
         store = Store(path: Config.dbPath)
         model.processed = Results.load()
         scanner = Scanner(store: store)
@@ -1120,6 +1132,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private var lastScanRefresh = Date.distantPast
+    /// 通知节流：同一天不重复叫人
+    private var lastNotified = Date.distantPast
     private var lastWasScanning = false
 
     private func apply(c: (secret: Int, work: Int, info: Int, files: Int), rows: [Store.Row]) {
@@ -1132,6 +1146,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             model.scanSummary = scanner.lastHits > 0
                 ? "扫描完成 · 新增 \(scanner.lastHits) 个文件命中"
                 : "扫描完成 · 没有新增命中"
+            // 只有「新发现」值得叫人，且半天最多一次；其余时刻一律静默改菜单栏
+            if scanner.lastHits > 0, Date().timeIntervalSince(lastNotified) > 12 * 3600 {
+                lastNotified = Date()
+                Notifier.post(title: "发现 \(scanner.lastHits) 个文件命中",
+                              body: "打开清单看看是哪几个")
+            }
         }
         lastWasScanning = scanner.scanning
         model.scanned = scanner.scanned
