@@ -624,6 +624,15 @@ enum Confidential {
     private static let levelExceptions = ["商业秘密", "个人秘密", "技术秘密", "私密", "解密", "泄密", "保密法", "保密工作", "保密协议"]
 
     /// 只认「标志」不认「提到」：密级标志是独占一行、通常跟星号或期限的短语；
+    /// 在谈论密级，而不是在标注密级。表格单元格里的「秘密」、说明书里的「字样」都是这一类。
+    /// 刻意不把引号算进来：真实的密级标志也常被写成「机密」★ 期限…，按引号降级会漏报。
+    private static func isTalkingAbout(_ line: String) -> Bool {
+        if line.contains("|") { return true }
+        let talk = ["字样", "二字", "一词", "所谓", "称为", "并非", "不得写成",
+                    "如何标注", "标注为", "写成「"]
+        return talk.contains { line.contains($0) }
+    }
+
     /// 正文里说「绝密级公文如何如何」不算。全盘扫描对这一条极敏感。
     static func classification(in text: String) -> (SecretLevel, String)? {
         let head = String(text.prefix(4000))
@@ -639,7 +648,7 @@ enum Confidential {
                 let pos = (line as NSString).range(of: "工作秘密").location
                 let marked = ["★", "☆", "*", "期限"].contains { line.contains($0) }
                 let prose = line.contains("，") || line.contains("。") || line.contains("；")
-                if (marked || pos <= 3) && !(prose && !marked) {
+                if (marked || pos <= 3) && !(prose && !marked), !isTalkingAbout(line) {
                     if best == nil { best = (.workSecret, "工作秘密") }
                 }
                 continue
@@ -657,6 +666,7 @@ enum Confidential {
                 let prose = line.contains("，") || line.contains("。") || line.contains("；")
                 guard markerish || atLineStart else { continue }
                 if prose && !markerish { continue }
+                if isTalkingAbout(line) { continue }
                 let matched = ns.substring(with: m.range)
                 if best == nil || level > best!.0 { best = (level, matched) }
             }
@@ -683,9 +693,20 @@ enum Confidential {
                      progress: ((Int, Int) -> Void)? = nil) -> Result {
         let started = Date()
         var r = Result()
+        // 枚举失败（没权限、盘断了）必须记下来：不然结论会替一个没看全的目录说「未发现」
+        var denied: [String] = []
         guard let en = FileManager.default.enumerator(
             at: root, includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey],
-            options: [.skipsHiddenFiles, .skipsPackageDescendants]) else { return r }
+            options: [.skipsHiddenFiles, .skipsPackageDescendants],
+            errorHandler: { url, _ in
+                denied.append(url.path)
+                return true
+            }) else {
+            r.skipped += 1
+            r.findings.append(ConfFinding(kind: .unscannable, file: root.lastPathComponent, place: "目录",
+                                          value: "打不开", note: "整个目录没能枚举，内容未检查", level: .info))
+            return r
+        }
         var paths: [URL] = []
         for case let u as URL in en {
             guard paths.count < limit else { break }
@@ -693,6 +714,12 @@ enum Confidential {
             if (try? u.resourceValues(forKeys: [.isRegularFileKey]))?.isRegularFile == true { paths.append(u) }
         }
         let base = root.resolvingSymlinksInPath().path
+        for p in denied {
+            let rel = p.hasPrefix(base + "/") ? String(p.dropFirst(base.count + 1)) : (p as NSString).lastPathComponent
+            r.skipped += 1
+            r.findings.append(ConfFinding(kind: .unscannable, file: rel, place: "目录",
+                                          value: "无权限", note: "这个目录没读成，内容未检查", level: .info))
+        }
         for (i, u) in paths.enumerated() {
             progress?(i + 1, paths.count)
             r.files += 1
@@ -1059,7 +1086,13 @@ extension Confidential.Result {
                      + (ocrPages > 0 ? "，OCR \(ocrPages) 页" : ""))
         let state = findings.filter { $0.level.isStateSecret }
         if state.isEmpty {
-            lines.append("国家秘密标志：未发现")
+            // 「没看到」不是「没有」：没查全的时候，通过结论必须带着缺口一起出现
+            let blind = findings.filter { $0.kind == .unscannable }.count
+            if blind > 0 {
+                lines.append("国家秘密标志：未发现（但 \(blind) 处没查成，结论不完整）")
+            } else {
+                lines.append("国家秘密标志：未发现")
+            }
         } else {
             let worst = state.map { $0.level }.max()!
             lines.append("国家秘密标志：**发现 \(worst.label)**（\(state.count) 处）")
@@ -1067,6 +1100,9 @@ extension Confidential.Result {
         let work = findings.filter { $0.level == .workSecret }.count
         let info = findings.filter { $0.level == .info }.count
         lines.append("工作秘密：\(work) 处；未检查（判不了内容）：\(info) 处")
+        if skipped > 0 {
+            lines.insert("没查：\(skipped) 处（没权限或读不出，这部分等于没看）", at: 1)
+        }
         lines.append("")
         if findings.isEmpty {
             lines.append("没有发现国家秘密或工作秘密标志。")
