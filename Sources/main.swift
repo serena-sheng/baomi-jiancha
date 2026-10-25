@@ -1065,7 +1065,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func updateStatusIcon(_ c: (secret: Int, work: Int, info: Int, files: Int)? = nil) {
         guard let b = statusItem.button else { return }
         let symbol: String
-        if scanner.scanning { symbol = "shield.lefthalf.filled" }
+        if scanner.scanning { symbol = "exclamationmark.shield" }
         else if let last = scanner.lastFinish, Date().timeIntervalSince(last) < 3600 * 24 { symbol = "checkmark.shield" }
         else { symbol = "shield" }
         let cfg = NSImage.SymbolConfiguration(pointSize: 15, weight: .regular)
@@ -1074,7 +1074,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         img?.isTemplate = true
         b.image = img
         let k = c ?? store.counts()
-        b.title = k.secret > 0 ? " \(k.secret)" : ""
+        // 菜单栏不写数字：三位数会把图标撑宽 30pt，破坏与系统图标的 18pt 节奏。
+        // 有没有命中看图标（实心盾 / 半盾），有几条在面板和主窗里说。
+        b.title = ""
         b.toolTip = scanner.scanning
             ? "正在扫描 \(scanner.scanned)/\(scanner.total)"
             : "保密检查 · \(k.secret) 个秘密标志 · 已索引 \(k.files) 个文件"
