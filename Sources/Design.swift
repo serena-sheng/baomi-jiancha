@@ -54,9 +54,32 @@ struct JPHairline: View {
 }
 
 /// 6pt 圆点：状态不只靠颜色，旁边永远有字
+enum JPDotShape {
+    case filled   // 待处理
+    case ring     // 已通过：通过是一种缺席，不该占一颗实心点
+    case halo     // 最高级：实心 + 外环，色盲也能与 filled 区分
+}
+
 struct JPDot: View {
     var color: Color
-    var body: some View { Circle().fill(color).frame(width: T.dot, height: T.dot) }
+    var shape: JPDotShape = .filled
+
+    @ViewBuilder
+    var body: some View {
+        switch shape {
+        case .filled:
+            Circle().fill(color).frame(width: T.dot, height: T.dot)
+        case .ring:
+            Circle().strokeBorder(color, lineWidth: 1.5).frame(width: T.dot, height: T.dot)
+        case .halo:
+            // 外环用 overlay 画，不占布局宽度：否则它会挤掉本该完整显示的那句话
+            Circle().fill(color).frame(width: T.dot, height: T.dot)
+                .overlay {
+                    Circle().strokeBorder(color.opacity(0.45), lineWidth: 1)
+                        .frame(width: 10, height: 10)
+                }
+        }
+    }
 }
 
 struct JPBar: View {

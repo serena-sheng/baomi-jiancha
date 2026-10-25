@@ -545,7 +545,7 @@ struct RowView: View {
 
             VStack(alignment: .leading, spacing: 3) {
                 HStack(alignment: .firstTextBaseline, spacing: 6) {
-                    JPDot(color: isSecret ? T.warn : (isWork ? T.ink2 : T.ink3))
+                    JPDot(color: isSecret ? T.warn : (isWork ? T.ink2 : T.ink3), shape: isSecret ? .halo : .filled)
                         .offset(y: -1)
                     // 无法检查这类信息也占一行，但只作为覆盖提示，不算命中
                     Text(isSecret || isWork ? level.label : "未检查")
