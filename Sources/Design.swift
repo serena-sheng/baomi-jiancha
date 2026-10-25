@@ -20,7 +20,8 @@ enum T {
     static let ink3   = dyn(0x67676F, 0xA0A0A6)   // 深色由 #949499 提到 4.6:1 以上
     static let hair   = dyn(0x000000, 0xFFFFFF, 0.08)
     static let track  = dyn(0x000000, 0xFFFFFF, 0.06)
-    static let accent = dyn(0x0066CC, 0x0A6FD8)   // 深色原本 #0A84FF，白字只有 3.65:1；#0A6FD8 = 4.91:1
+    static let accent = dyn(0x0066CC, 0x7FA9B8)   // 深色不压白字：#7FA9B8 配 onAccent 深字 6.8:1
+    static let onAccent = dyn(0xFFFFFF, 0x1B1B1D) // 深色主按钮是亮底深字，白字压亮蓝只有 2.5:1
     static let ok     = dyn(0x1B7A34, 0x32D74B)
     static let warn   = dyn(0xB25000, 0xFF9F0A)
 
