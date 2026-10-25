@@ -127,6 +127,115 @@ func systemIdleSeconds() -> Double {
     return CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: anyInput)
 }
 
+// MARK: - 确认框（不能用 NSAlert.runModal）
+
+/// 这个 app 是 .accessory（菜单栏常驻），没有可成为 key 的窗口时
+/// `NSAlert.runModal()` 会在 1.8 秒后**自己返回第一个按钮**——等于没人点也替你点了。
+/// 所以确认一律走自己的小窗口，答案只能来自按钮。
+final class ConfirmController {
+    static let shared = ConfirmController()
+
+    private var window: NSWindow?
+    private var completion: ((Bool) -> Void)?
+    private var guard_ = false
+    private var tag = ""
+
+    private init() {}
+
+    func present(title: String, message: String,
+                 confirmTitle: String, cancelTitle: String,
+                 onDecision: @escaping (Bool) -> Void) {
+        close()          // 同一时刻只留一个
+        completion = onDecision
+        tag = UUID().uuidString.prefix(4).description
+
+        let box = NSStackView()
+        box.orientation = .vertical
+        box.alignment = .leading
+        box.spacing = 10
+        box.edgeInsets = NSEdgeInsets(top: 20, left: 22, bottom: 18, right: 22)
+
+        let head = NSTextField(labelWithString: title)
+        head.font = .systemFont(ofSize: 15, weight: .semibold)
+        head.textColor = .labelColor
+        head.lineBreakMode = .byWordWrapping
+        head.maximumNumberOfLines = 2
+
+        let body = NSTextField(wrappingLabelWithString: message)
+        body.font = .systemFont(ofSize: 12.5)
+        body.textColor = .secondaryLabelColor
+        body.preferredMaxLayoutWidth = 360
+
+        let row = NSStackView()
+        row.orientation = .horizontal
+        row.spacing = 8
+        row.alignment = .centerY
+
+        let cancel = NSButton(title: cancelTitle, target: self, action: #selector(pickCancel))
+        cancel.bezelStyle = .rounded
+
+        let confirm = NSButton(title: confirmTitle, target: self, action: #selector(pickConfirm))
+        confirm.bezelStyle = .rounded
+
+        row.addView(NSView(), in: .leading)
+        row.addArrangedSubview(cancel)
+        row.addArrangedSubview(confirm)
+
+        box.addArrangedSubview(head)
+        box.addArrangedSubview(body)
+        box.addArrangedSubview(row)
+        row.widthAnchor.constraint(equalTo: box.widthAnchor, constant: -44).isActive = true
+
+        let win = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 420, height: 200),
+                           styleMask: [.titled, .fullSizeContentView],
+                           backing: .buffered, defer: false)
+        win.titleVisibility = .hidden
+        win.titlebarAppearsTransparent = true
+        win.isMovableByWindowBackground = true
+        win.level = .floating
+        win.isReleasedWhenClosed = false
+        win.delegate = closeWatcher
+        win.contentView = box
+        win.setContentSize(box.fittingSize)
+        win.center()
+        window = win
+        NSApp.activate(ignoringOtherApps: true)
+        win.makeKeyAndOrderFront(nil)
+        Log.w("confirm: 弹窗[\(tag)] \(title) active=\(NSApp.isActive) key=\(win.isKeyWindow)")
+    }
+
+    private let closeWatcher = WindowCloseWatcher()
+
+    @objc private func pickConfirm() { finish(true) }
+    @objc private func pickCancel() { finish(false) }
+
+    private func finish(_ answer: Bool) {
+        Log.w("confirm: 回答 \(answer ? "确认" : "取消")")
+        guard !guard_ else { return }
+        guard_ = true
+        let cb = completion
+        completion = nil
+        close()
+        cb?(answer)
+    }
+
+    func close() {
+        window?.orderOut(nil)
+        window = nil
+        guard_ = false
+        closeWatcher.onClose = { [weak self] in self?.finish(false) }
+    }
+}
+
+final class WindowCloseWatcher: NSObject, NSWindowDelegate {
+    var onClose: (() -> Void)?
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        Log.w("confirm: 窗口被要求关闭，按跳过处理")
+        onClose?()
+        return false
+    }
+}
+
 // MARK: - 扫描器
 
 final class Scanner {
@@ -1152,14 +1261,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// 确认一律走自己的窗口：本 app 是 .accessory，NSAlert.runModal 会在大约 1.8 秒后
+    /// 自己返回第一个按钮——脱密这种不可逆动作绝不能被「没人点也替我点」放过去
     private func confirm(_ message: String, _ info: String) -> Bool {
-        let a = NSAlert()
-        a.messageText = message
-        a.informativeText = info
-        a.addButton(withTitle: "继续")
-        a.addButton(withTitle: "取消")
-        NSApp.activate(ignoringOtherApps: true)
-        return a.runModal() == .alertFirstButtonReturn
+        var answer = false
+        var settled = false
+        DispatchQueue.main.async {
+            ConfirmController.shared.present(title: message, message: info,
+                                             confirmTitle: "继续", cancelTitle: "取消") { ok in
+                answer = ok
+                settled = true
+            }
+        }
+        let deadline = Date().addingTimeInterval(120)
+        if Thread.isMainThread {
+            // 主线程里不能死等：转一会儿 runloop，等窗口给出答案
+            while !settled, Date() < deadline {
+                RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.05))
+            }
+        } else {
+            while !settled, Date() < deadline { Thread.sleep(forTimeInterval: 0.05) }
+        }
+        if !settled { ConfirmController.shared.close() }
+        return settled && answer
     }
 
     private func retry(_ original: String) {
