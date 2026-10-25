@@ -879,7 +879,7 @@ enum Confidential {
         if let (level, matched) = classification(in: text) {
             var ctx = ""
             if let range = text.range(of: matched) {
-                ctx = snippet(text, at: NSRange(range, in: text), token: matched, span: 18)
+                ctx = snippet(text, at: NSRange(range, in: text), token: matched, span: 14)
             }
             r.findings.append(ConfFinding(kind: .classification, file: file, place: place,
                                           value: matched,

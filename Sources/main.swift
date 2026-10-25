@@ -494,6 +494,20 @@ struct RowView: View {
 
     private var level: SecretLevel { SecretLevel(rawValue: row.level) ?? .info }
 
+
+    /// 摘录里把「」包住的命中词加重：用户要能在半秒内看出「凭什么判它是密级标志」
+    private var ctxText: Text {
+        let src = row.ctx
+        guard let l = src.firstIndex(of: "「"), let r = src[l...].firstIndex(of: "」"), l < r else {
+            return Text(src).foregroundStyle(T.ink2)
+        }
+        let before = String(src[src.startIndex..<l])
+        let hit = String(src[l...r])
+        let after = String(src[src.index(after: r)...])
+        return Text(before).foregroundStyle(T.ink2)
+            + Text(hit).foregroundStyle(isSecret ? T.warn : T.ink).bold()
+            + Text(after).foregroundStyle(T.ink2)
+    }
     /// 行内两个证据出口：打开原件看一眼、在访达里定位。
     /// 路径是绝对路径（入库时用 u.path），所以直接开，不必再穿一层闭包。
     private var hstack_actions: some View {
@@ -585,9 +599,8 @@ struct RowView: View {
                     }
                 }
                 if !row.ctx.isEmpty {
-                    Text(row.ctx)
+                    ctxText
                         .font(.jpB)
-                        .foregroundStyle(T.ink2)
                         .lineLimit(1)
                         .truncationMode(.tail)
                         .padding(.leading, 44)
