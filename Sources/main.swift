@@ -861,7 +861,12 @@ struct MainView: View {
                     .font(.jpC).foregroundStyle(T.ink2)
                 JPButton(title: "中止", kind: .ghost, action: onStopProcessing)
             } else if !model.selected.isEmpty {
-                Text("已选 \(model.selected.count) 个").font(.jpC).foregroundStyle(T.ink3)
+let visible = Set(model.rows.map { $0.path })
+                let hidden = model.selected.subtracting(visible).count
+                // 选区跨页/跨筛选时必须看得见，否则主按钮的作用域是隐形的
+                Text(hidden > 0 ? "已选 \(model.selected.count) 个 · 含 \(hidden) 个不在本页"
+                                : "已选 \(model.selected.count) 个")
+                    .font(.jpC).foregroundStyle(hidden > 0 ? T.ink2 : T.ink3)
                 JPButton(title: "脱密选中 \(model.selected.count) 个", kind: .primary) {
                     onProcess(Array(model.selected))
                 }

@@ -626,8 +626,17 @@ enum Confidential {
     /// 只认「标志」不认「提到」：密级标志是独占一行、通常跟星号或期限的短语；
     /// 在谈论密级，而不是在标注密级。表格单元格里的「秘密」、说明书里的「字样」都是这一类。
     /// 刻意不把引号算进来：真实的密级标志也常被写成「机密」★ 期限…，按引号降级会漏报。
-    private static func isTalkingAbout(_ line: String) -> Bool {
-        if line.contains("|") { return true }
+    private static func isTalkingAbout(_ line: String, matched: String) -> Bool {
+        // 表格单元格里的裸词：命中词前后都是竖线，且整行没有星号/期限。
+        // 不能只看「有没有 |」——真标志也常被写进表格（秘密 | 期限10年），那样会漏报。
+        let marked = ["★", "☆", "*", "期限"].contains { line.contains($0) }
+        if !marked, let r = line.range(of: matched) {
+            let before = line[line.startIndex..<r.lowerBound]
+            let after = line[r.upperBound...]
+            let pipeNear = before.hasSuffix("|") || before.hasSuffix("| ")
+                || after.hasPrefix("|") || after.hasPrefix(" |")
+            if pipeNear { return true }
+        }
         let talk = ["字样", "二字", "一词", "所谓", "称为", "并非", "不得写成",
                     "如何标注", "标注为", "写成「"]
         return talk.contains { line.contains($0) }
@@ -648,7 +657,7 @@ enum Confidential {
                 let pos = (line as NSString).range(of: "工作秘密").location
                 let marked = ["★", "☆", "*", "期限"].contains { line.contains($0) }
                 let prose = line.contains("，") || line.contains("。") || line.contains("；")
-                if (marked || pos <= 3) && !(prose && !marked), !isTalkingAbout(line) {
+                if (marked || pos <= 3) && !(prose && !marked), !isTalkingAbout(line, matched: "工作秘密") {
                     if best == nil { best = (.workSecret, "工作秘密") }
                 }
                 continue
@@ -666,8 +675,8 @@ enum Confidential {
                 let prose = line.contains("，") || line.contains("。") || line.contains("；")
                 guard markerish || atLineStart else { continue }
                 if prose && !markerish { continue }
-                if isTalkingAbout(line) { continue }
                 let matched = ns.substring(with: m.range)
+                if isTalkingAbout(line, matched: matched) { continue }
                 if best == nil || level > best!.0 { best = (level, matched) }
             }
         }
