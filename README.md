@@ -6,6 +6,25 @@ macOS 常驻后台的全盘保密检查工具。装在菜单栏，插上电就�
 
 > 从「净盘」抽出来的检查引擎独立成一个项目。净盘管一块 U 盘；保密检查管这台机器上所有能读到的文件。
 
+
+## ⚠️ 依赖「净盘」仓库，不能单独 clone
+
+`Sources/Design.swift` 是指向 `../../jingpan/Sources/Design.swift` 的相对符号链接，
+设计系统（颜色、字号、按钮、圆点）的唯一真源在
+[净盘](https://github.com/serena-sheng/jingpan) 那个仓库里。
+
+**两个仓库必须并列放在同一父目录下**：
+
+```
+~/dev/jingpan/          ← 设计真源在这里
+~/dev/baomi-jiancha/    ← Sources/Design.swift 指向上一行
+```
+
+单独 clone 本仓库时链接会断，`./build.sh` 会以退出码 1 报错：
+`! Sources/Design.swift 断链：它指向 ../jingpan/Sources/Design.swift`。
+
+这不是疏漏，是有意的：两个应用本来就该长得一样，一份实现比两份「保持同步」的副本更可靠。
+
 ## 它查什么
 
 只有两类进清单、参与脱密：**国家秘密**（绝密 / 机密 / 秘密）与**工作秘密**。内部资料、证件号、文档属性、照片位置一律不报。
