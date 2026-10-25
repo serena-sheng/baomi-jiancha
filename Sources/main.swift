@@ -549,17 +549,19 @@ struct RowView: View {
                         .offset(y: -1)
                     // 无法检查这类信息也占一行，但只作为覆盖提示，不算命中
                     Text(isSecret || isWork ? level.label : "未检查")
+                        .frame(width: 52, alignment: .leading)
                         .font(.jpC)
                         .foregroundStyle(isSecret ? T.warn : T.ink3)
                     Text((row.path as NSString).lastPathComponent)
                         .font(.jpB)
                         .foregroundStyle(T.ink)
                         .lineLimit(1)
-                        .truncationMode(.middle)
-                    Text(row.kind + (row.place.isEmpty || row.place == "正文" ? "" : " · \(row.place)"))
+                    if row.level > 0 {
+                        Text(row.kind + (row.place.isEmpty || row.place == "正文" ? "" : " · \(row.place)"))
                         .font(.jpC)
                         .foregroundStyle(T.ink3)
                         .lineLimit(1)
+                    }
                     Spacer(minLength: 6)
                     if let status {
                         Text(status)
@@ -590,17 +592,12 @@ struct RowView: View {
                         .truncationMode(.tail)
                         .padding(.leading, 44)
                 }
-                Text((row.path as NSString).deletingLastPathComponent)
-                    .font(.jpC)
-                    .foregroundStyle(T.ink3)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                    .padding(.leading, 44)
+
             }
         }
         .padding(.leading, selected ? T.padH - 6 : T.padH)
         .padding(.trailing, T.padH)
-        .padding(.vertical, 9)
+        .padding(.vertical, 6)
         .overlay(alignment: .leading) {
             if selected {
                 RoundedRectangle(cornerRadius: 1)
