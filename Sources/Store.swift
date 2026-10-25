@@ -73,13 +73,13 @@ final class Store {
         }
 
         // 默认规则集换代：只替换我们自己种下的那几条，用户自建的原样保留
-        if meta("suppressVersion") != "2" {
+        if meta("suppressVersion") != "3" {
             exec("""
             DELETE FROM suppressions
             WHERE note LIKE '%源码目录%' OR note LIKE '%画面内容%' OR note = '同 .png'
             """)
             exec("DELETE FROM meta WHERE key='suppressSeeded'")
-            setMeta("suppressVersion", "2")
+            setMeta("suppressVersion", "3")
         }
 
         // 抑制规则是用户意图，不随判定口径换代清空；命中状态要跟着当前库重算一次
@@ -126,6 +126,8 @@ final class Store {
             case let s as String:  bind(st, idx, s)
             case let d as Double:  sqlite3_bind_double(st, idx, d)
             case let n as Int:     sqlite3_bind_int64(st, idx, Int64(n))
+            // Int64 不绑就等于 WHERE 传了 NULL：UPDATE 会静默命中 0 行
+            case let n as Int64:   sqlite3_bind_int64(st, idx, n)
             default: break
             }
         }
@@ -447,12 +449,12 @@ extension Store {
         // 整目录一压就等于给开发者开了后门。只压「图片里 OCR 出来的秘密/机密」：
         // 那是画面内容，不是文件自身的密级标志；绝密仍由红线兜住。
         let rules: [(String, String, Int?, Int, Int, String)] = [
-            ("suffix", ".png", 1, 2, 3, "截图画面里的密级字样是画面内容，不是文件自身的标志"),
-            ("suffix", ".jpg", 1, 2, 3, "同 .png"),
-            ("suffix", ".jpeg", 1, 2, 3, "同 .png"),
-            ("suffix", ".heic", 1, 2, 3, "同 .png"),
-            ("suffix", ".tif", 1, 2, 3, "同 .png"),
-            ("suffix", ".tiff", 1, 2, 3, "同 .png"),
+            ("suffix", ".png", 1, 2, 4, "截图画面里的密级字样是画面内容，不是文件自身的标志"),
+            ("suffix", ".jpg", 1, 2, 4, "同 .png"),
+            ("suffix", ".jpeg", 1, 2, 4, "同 .png"),
+            ("suffix", ".heic", 1, 2, 4, "同 .png"),
+            ("suffix", ".tif", 1, 2, 4, "同 .png"),
+            ("suffix", ".tiff", 1, 2, 4, "同 .png"),
         ]
         for r in rules {
             addSuppression(scope: r.0, pattern: r.1, viaOCR: r.2,
@@ -475,9 +477,11 @@ extension Store {
 /// 抽成 file-scope 函数是因为命令行 `--scan` 也要用同一套口径，
 /// 否则窗口说「干净」、命令行说「33 处命中」，等于一份事实两处实现。
 func suppressionMode(path: String, level: Int, ocr: Int, rules: [Suppression]) -> Int {
-    // 红线：绝密（level 4）不可抑制。写在这里而不是只靠规则的 max_level，
-    // 是因为规则可以被改成 4，而这条不该被任何配置绕过。
-    if level >= 4 { return 0 }
+    // 红线：正文里判出的绝密不可抑制。写在代码里而不是只靠规则的 max_level，
+    // 因为规则可以被改高，而这条不该被任何配置绕过。
+    // 但「图片里 OCR 出来的绝密」不在此列：那可能是界面截图、海报、书封，
+    // 机器认字认错了不该让规则替它背锅——这类只允许进「已忽略」，并且必须列得出来。
+    if level >= 4 && ocr == 0 { return 0 }
     var best: Suppression?
     for r in rules {
         guard level >= r.minLevel, level <= r.maxLevel else { continue }
