@@ -33,6 +33,28 @@ final class Store {
         exec("CREATE INDEX IF NOT EXISTS idx_find_level ON findings(level DESC, found_at DESC);")
         exec("CREATE INDEX IF NOT EXISTS idx_find_path ON findings(path);")
         exec("CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);")
+        // 抑制规则：把「自己产物的噪声」挡在报警之外，但不删记录、不改判定。
+        // 三条红线：① 绝密默认不可 hide ② kind='无法检查' 永不参与抑制 ③ 只作用显示与计数，不动 findings 原始行。
+        exec("""
+        CREATE TABLE IF NOT EXISTS suppressions(
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          scope TEXT NOT NULL,             -- dir | suffix | glob
+          pattern TEXT NOT NULL,           -- 绝对目录 / .png / *截图*.png
+          via_ocr INTEGER,                 -- NULL=不限 0=仅正文 1=仅 OCR
+          min_level INTEGER NOT NULL DEFAULT 2,
+          max_level INTEGER NOT NULL DEFAULT 3,
+          mode TEXT NOT NULL DEFAULT 'mute',   -- mute=不叫人但清单可见 | hide=清单默认隐藏
+          note TEXT,
+          enabled INTEGER NOT NULL DEFAULT 1,
+          created_at REAL);
+        """)
+        exec("CREATE INDEX IF NOT EXISTS idx_supp_enabled ON suppressions(enabled, scope);")
+        // 早期版本把 nil 写成 -1，规则会永远匹配不上；顺手清一遍
+        exec("UPDATE suppressions SET via_ocr=NULL WHERE via_ocr<0;")
+        if !hasColumn("findings", "muted") {
+            exec("ALTER TABLE findings ADD COLUMN muted INTEGER NOT NULL DEFAULT 0;")
+        }
+        exec("CREATE INDEX IF NOT EXISTS idx_find_muted ON findings(muted, level DESC);")
         // 口径收紧：只留「密级标志」里的国家秘密 / 工作秘密，加「无法检查」。
         // 旧版本留下的内部资料、证件号、文档属性、修订、批注、照片位置等记录一次清掉，
         // 否则它们会以新标签重新出现在清单里
@@ -47,6 +69,10 @@ final class Store {
             setMeta("rulesVersion", Self.rulesVersion)
             Log.w("store: 判定规则换代（\(Self.rulesVersion)），索引已清空，等一次全量重扫")
         }
+
+        // 抑制规则是用户意图，不随判定口径换代清空；命中状态要跟着当前库重算一次
+        seedDefaultSuppressionsIfNeeded()
+        recomputeMuted()
     }
 
     deinit { sqlite3_close(db) }
@@ -58,6 +84,17 @@ final class Store {
             Log.w("store: sql 失败 \(String(cString: sqlite3_errmsg(db)))")
             return
         }
+    }
+
+    /// 判断某表是否已有某列（迁移用）
+    private func hasColumn(_ table: String, _ col: String) -> Bool {
+        var st: OpaquePointer?
+        defer { sqlite3_finalize(st) }
+        guard sqlite3_prepare_v2(db, "PRAGMA table_info(\(table))", -1, &st, nil) == SQLITE_OK else { return false }
+        while sqlite3_step(st) == SQLITE_ROW {
+            if text(st, 1) == col { return true }
+        }
+        return false
     }
 
     private func bind(_ st: OpaquePointer?, _ idx: Int32, _ s: String) {
@@ -165,13 +202,18 @@ final class Store {
         lock.lock(); defer { lock.unlock() }
         run("DELETE FROM findings WHERE path=?1", [path])
         guard !hits.isEmpty else { return }
+        // 入库时就算好抑制状态：否则每个文件一次全表重算，扫描会变成 O(n²)
+        let rules = readSuppressionsLocked().filter { $0.enabled }
         exec("BEGIN;")
         for h in hits {
+            let muted = (h.kind.rawValue == "密级标志" && !rules.isEmpty)
+                ? suppressionMode(path: path, level: h.level.rawValue, ocr: h.viaOCR ? 1 : 0, rules: rules)
+                : 0
             run("""
-            INSERT INTO findings(path,kind,level,place,value,note,ctx,via_ocr,found_at)
-            VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)
+            INSERT INTO findings(path,kind,level,place,value,note,ctx,via_ocr,found_at,muted)
+            VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
             """, [path, h.kind.rawValue, h.level.rawValue, h.place, h.value, h.note, h.context,
-                  h.viaOCR ? 1 : 0, Date().timeIntervalSince1970])
+                  h.viaOCR ? 1 : 0, Date().timeIntervalSince1970, muted])
         }
         exec("COMMIT;")
     }
@@ -193,25 +235,29 @@ final class Store {
         var ctx: String
     }
 
-    func findingsCount(minLevel: Int = 0) -> Int {
+    func findingsCount(minLevel: Int = 0, suppressedOnly: Bool = false) -> Int {
         lock.lock(); defer { lock.unlock() }
         var st: OpaquePointer?
         defer { sqlite3_finalize(st) }
-        guard sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM findings WHERE level >= ?1", -1, &st, nil) == SQLITE_OK else { return 0 }
+        let whereMuted = suppressedOnly ? "muted>0" : "muted=0"
+        guard sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM findings WHERE level >= ?1 AND \(whereMuted)",
+                                 -1, &st, nil) == SQLITE_OK else { return 0 }
         sqlite3_bind_int(st, 1, Int32(minLevel))
         guard
               sqlite3_step(st) == SQLITE_ROW else { return 0 }
         return Int(sqlite3_column_int(st, 0))
     }
 
-    func findings(limit: Int = 50, offset: Int = 0, minLevel: Int = 0) -> [Row] {
+    func findings(limit: Int = 50, offset: Int = 0, minLevel: Int = 0,
+                  suppressedOnly: Bool = false) -> [Row] {
         lock.lock(); defer { lock.unlock() }
         var out: [Row] = []
         var st: OpaquePointer?
         defer { sqlite3_finalize(st) }
+        let whereMuted = suppressedOnly ? "muted>0" : "muted=0"
         guard sqlite3_prepare_v2(db, """
         SELECT path,kind,level,place,value,note,ctx FROM findings
-        WHERE level >= ?3
+        WHERE level >= ?3 AND \(whereMuted)
         ORDER BY level DESC, found_at DESC LIMIT ?1 OFFSET ?2
         """, -1, &st, nil) == SQLITE_OK else { return out }
         sqlite3_bind_int(st, 1, Int32(limit))
@@ -228,7 +274,7 @@ final class Store {
         lock.lock(); defer { lock.unlock() }
         var secret = 0, work = 0, info = 0, files = 0
         var st: OpaquePointer?
-        if sqlite3_prepare_v2(db, "SELECT level, COUNT(*) FROM findings GROUP BY level", -1, &st, nil) == SQLITE_OK {
+        if sqlite3_prepare_v2(db, "SELECT level, COUNT(*) FROM findings WHERE muted=0 GROUP BY level", -1, &st, nil) == SQLITE_OK {
             while sqlite3_step(st) == SQLITE_ROW {
                 let level = Int(sqlite3_column_int(st, 0))
                 let n = Int(sqlite3_column_int(st, 1))
@@ -259,6 +305,230 @@ final class Store {
         guard sqlite3_prepare_v2(db, "SELECT value FROM meta WHERE key=?1", -1, &st, nil) == SQLITE_OK
         else { return nil }
         bind(st, 1, key)
+        guard sqlite3_step(st) == SQLITE_ROW else { return nil }
+        return text(st, 0)
+    }
+}
+
+// MARK: - 抑制规则
+//
+// 噪声明明是真的（截图里确实有「绝密」二字），但它不该占据报警位。
+// 所以抑制只作用「叫人」与「清单默认可见性」，从不删除、从不改判定。
+// 三条红线见 Store.init 的建表注释。
+
+struct Suppression {
+    var id: Int64 = 0
+    var scope: String = "dir"          // dir | suffix | glob
+    var pattern: String = ""
+    var viaOCR: Int? = nil             // nil = 不限；0 = 仅正文；1 = 仅 OCR
+    var minLevel: Int = 2
+    var maxLevel: Int = 3
+    var mode: String = "mute"          // mute | hide
+    var note: String = ""
+    var enabled: Bool = true
+
+    /// 越具体越优先：dir > suffix > glob；同类比 pattern 长度
+    var specificity: (Int, Int) {
+        switch scope {
+        case "dir":    return (3, pattern.count)
+        case "suffix": return (2, pattern.count)
+        default:       return (1, pattern.filter { $0 != "*" && $0 != "?" }.count)
+        }
+    }
+}
+
+/// 只支持 * 与 ?，够用且可预期；不引入正则，避免规则写错很难看出来
+private func globMatch(_ pattern: String, _ text: String) -> Bool {
+    let p = Array(pattern), t = Array(text)
+    var pi = 0, ti = 0, star = -1, mark = 0
+    while ti < t.count {
+        if pi < p.count && (p[pi] == "?" || p[pi] == t[ti]) {
+            pi += 1; ti += 1
+        } else if pi < p.count && p[pi] == "*" {
+            star = pi; mark = ti; pi += 1
+        } else if star >= 0 {
+            pi = star + 1; mark += 1; ti = mark
+        } else {
+            return false
+        }
+    }
+    while pi < p.count && p[pi] == "*" { pi += 1 }
+    return pi == p.count
+}
+
+extension Store {
+    private func readSuppressionsLocked() -> [Suppression] {
+        var out: [Suppression] = []
+        var st: OpaquePointer?
+        defer { sqlite3_finalize(st) }
+        guard sqlite3_prepare_v2(db, """
+        SELECT id,scope,pattern,via_ocr,min_level,max_level,mode,note,enabled
+        FROM suppressions ORDER BY id
+        """, -1, &st, nil) == SQLITE_OK else { return out }
+        while sqlite3_step(st) == SQLITE_ROW {
+            var s = Suppression()
+            s.id = sqlite3_column_int64(st, 0)
+            s.scope = text(st, 1)
+            s.pattern = text(st, 2)
+            // -1 是历史上把 nil 写成 int 的坏数据，一并当 NULL 读
+            let via = sqlite3_column_type(st, 3) == SQLITE_NULL ? -1 : Int(sqlite3_column_int(st, 3))
+            s.viaOCR = via < 0 ? nil : via
+            s.minLevel = Int(sqlite3_column_int(st, 4))
+            s.maxLevel = Int(sqlite3_column_int(st, 5))
+            s.mode = text(st, 6)
+            s.note = text(st, 7)
+            s.enabled = sqlite3_column_int(st, 8) != 0
+            out.append(s)
+        }
+        return out
+    }
+
+    func suppressions() -> [Suppression] {
+        lock.lock(); defer { lock.unlock() }
+        return readSuppressionsLocked()
+    }
+
+    @discardableResult
+    func addSuppression(scope: String, pattern: String, viaOCR: Int? = nil,
+                        minLevel: Int = 2, maxLevel: Int = 3,
+                        mode: String = "mute", note: String = "", enabled: Bool = true) -> Int64 {
+        lock.lock(); defer { lock.unlock() }
+        if let via = viaOCR {
+            run("""
+            INSERT INTO suppressions(scope,pattern,via_ocr,min_level,max_level,mode,note,enabled,created_at)
+            VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)
+            """, [scope, pattern, via, minLevel, maxLevel, mode, note,
+                  enabled ? 1 : 0, Date().timeIntervalSince1970])
+        } else {
+            run("""
+            INSERT INTO suppressions(scope,pattern,via_ocr,min_level,max_level,mode,note,enabled,created_at)
+            VALUES(?1,?2,NULL,?3,?4,?5,?6,?7,?8)
+            """, [scope, pattern, minLevel, maxLevel, mode, note,
+                  enabled ? 1 : 0, Date().timeIntervalSince1970])
+        }
+        let id = sqlite3_last_insert_rowid(db)
+        recomputeMutedLocked()
+        return id
+    }
+
+    func setSuppressionEnabled(_ id: Int64, _ enabled: Bool) {
+        lock.lock(); defer { lock.unlock() }
+        run("UPDATE suppressions SET enabled=?2 WHERE id=?1", [id, enabled ? 1 : 0])
+        recomputeMutedLocked()
+    }
+
+    func removeSuppression(_ id: Int64) {
+        lock.lock(); defer { lock.unlock() }
+        run("DELETE FROM suppressions WHERE id=?1", [id])
+        recomputeMutedLocked()
+    }
+
+    /// 首次运行种下默认规则。D2 只静音「秘密」级 OCR 命中：图片里的「机密」也可能是真扫描件，宁可多报。
+    func seedDefaultSuppressionsIfNeeded() {
+        lock.lock()
+        let existing = readSuppressionsLocked()
+        let seeded = metaLocked("suppressSeeded") == "1"
+        lock.unlock()
+        guard !seeded, existing.isEmpty else { return }
+
+        let dev = NSHomeDirectory() + "/dev"
+        let rules: [(String, String, Int?, Int, Int, String)] = [
+            ("dir", dev, nil, 2, 4, "源码目录只放示例文档，真实涉密原件不会落在这里"),
+            ("suffix", ".png", 1, 2, 2, "截图画面里的密级字样是画面内容，不是文件自身的标志"),
+            ("suffix", ".jpg", 1, 2, 2, "同 .png"),
+            ("suffix", ".jpeg", 1, 2, 2, "同 .png"),
+            ("suffix", ".heic", 1, 2, 2, "同 .png"),
+        ]
+        for r in rules {
+            addSuppression(scope: r.0, pattern: r.1, viaOCR: r.2,
+                           minLevel: r.3, maxLevel: r.4, note: r.5)
+        }
+        lock.lock()
+        run("INSERT INTO meta(key,value) VALUES('suppressSeeded','1') ON CONFLICT(key) DO UPDATE SET value='1'", [])
+        lock.unlock()
+        Log.w("store: 已种下 \(rules.count) 条默认不报规则")
+    }
+
+    /// 把抑制状态刷进 findings.muted：1 = 不叫人但清单可见，2 = 清单默认隐藏，0 = 正常
+    func recomputeMuted() {
+        lock.lock(); defer { lock.unlock() }
+        recomputeMutedLocked()
+    }
+}
+
+/// 一条命中属于哪档：0 正常 / 1 不叫人但可见 / 2 清单隐藏。规则取最具体的一条。
+/// 抽成 file-scope 函数是因为命令行 `--scan` 也要用同一套口径，
+/// 否则窗口说「干净」、命令行说「33 处命中」，等于一份事实两处实现。
+func suppressionMode(path: String, level: Int, ocr: Int, rules: [Suppression]) -> Int {
+    var best: Suppression?
+    for r in rules {
+        guard level >= r.minLevel, level <= r.maxLevel else { continue }
+        if let want = r.viaOCR, want != ocr { continue }
+        let hit: Bool
+        switch r.scope {
+        case "dir":
+            hit = path == r.pattern || path.hasPrefix(r.pattern + "/")
+        case "suffix":
+            hit = path.lowercased().hasSuffix(r.pattern.lowercased())
+        default:
+            hit = globMatch(r.pattern, (path as NSString).lastPathComponent)
+        }
+        guard hit else { continue }
+        if let b = best {
+            let (br, bl) = b.specificity, (nr, nl) = r.specificity
+            if nr > br || (nr == br && nl > bl) { best = r }
+        } else {
+            best = r
+        }
+    }
+    guard let b = best else { return 0 }
+    return b.mode == "hide" ? 2 : 1
+}
+
+extension Store {
+    private func recomputeMutedLocked() {
+        let rules = readSuppressionsLocked().filter { $0.enabled }
+        guard !rules.isEmpty else {
+            exec("UPDATE findings SET muted=0;")
+            return
+        }
+        // 只取够判定的列；kind 已在 SQL 里限定，「无法检查」永不参与抑制
+        var rows: [(Int64, String, Int, Int)] = []
+        var st: OpaquePointer?
+        if sqlite3_prepare_v2(db, "SELECT id,path,level,via_ocr FROM findings WHERE kind='密级标志'",
+                              -1, &st, nil) == SQLITE_OK {
+            while sqlite3_step(st) == SQLITE_ROW {
+                rows.append((sqlite3_column_int64(st, 0), text(st, 1),
+                             Int(sqlite3_column_int(st, 2)), Int(sqlite3_column_int(st, 3))))
+            }
+        }
+        sqlite3_finalize(st)
+
+        exec("UPDATE findings SET muted=0 WHERE kind='密级标志';")
+        exec("BEGIN;")
+        for (id, path, level, ocr) in rows {
+            let mode = suppressionMode(path: path, level: level, ocr: ocr, rules: rules)
+            if mode > 0 { run("UPDATE findings SET muted=?2 WHERE id=?1", [id, mode]) }
+        }
+        exec("COMMIT;")
+        Log.w("store: 抑制重算完成，规则 \(rules.count) 条，命中 \(rows.count) 条")
+    }
+
+    /// 被抑制的条数（mute + hide），用于界面「显示被抑制的 N 条」
+    func suppressedCount() -> Int {
+        lock.lock(); defer { lock.unlock() }
+        var st: OpaquePointer?
+        defer { sqlite3_finalize(st) }
+        guard sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM findings WHERE muted>0", -1, &st, nil) == SQLITE_OK,
+              sqlite3_step(st) == SQLITE_ROW else { return 0 }
+        return Int(sqlite3_column_int(st, 0))
+    }
+
+    private func metaLocked(_ k: String) -> String? {
+        var st: OpaquePointer?
+        defer { sqlite3_finalize(st) }
+        guard sqlite3_prepare_v2(db, "SELECT value FROM meta WHERE key=?1", -1, &st, nil) == SQLITE_OK else { return nil }
+        bind(st, 1, k)
         guard sqlite3_step(st) == SQLITE_ROW else { return nil }
         return text(st, 0)
     }

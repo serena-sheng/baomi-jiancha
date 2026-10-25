@@ -402,6 +402,9 @@ final class Model: ObservableObject {
     @Published var work = 0
     @Published var info = 0
     @Published var files = 0
+    /// 被「不报」规则压住的条数：不叫人，但要让用户知道系统看见过
+    @Published var suppressed = 0
+    @Published var onlySuppressed = false
     @Published var scanning = false
     @Published var scanned = 0
     @Published var total = 0
@@ -476,6 +479,36 @@ struct RowView: View {
     @State private var hovering = false
 
     private var level: SecretLevel { SecretLevel(rawValue: row.level) ?? .info }
+
+    /// 行内两个证据出口：打开原件看一眼、在访达里定位。
+    /// 路径是绝对路径（入库时用 u.path），所以直接开，不必再穿一层闭包。
+    private var hstack_actions: some View {
+        HStack(spacing: 2) {
+            Button {
+                let u = URL(fileURLWithPath: row.path)
+                guard FileManager.default.fileExists(atPath: row.path) else { return }
+                NSWorkspace.shared.open(u)
+            } label: {
+                Image(systemName: "arrow.up.forward.square")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(hovering ? T.ink2 : T.ink3)
+                    .frame(width: 20, height: 20)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help("打开原件看一眼，不会改动（⌘O）")
+
+            Button { onReveal() } label: {
+                Image(systemName: "folder")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(hovering ? T.ink2 : T.ink3)
+                    .frame(width: 20, height: 20)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help("在访达中显示（⇧⌘R）")
+        }
+    }
     private var isSecret: Bool { level.isStateSecret }
     private var isWork: Bool { level == .workSecret }
 
@@ -513,17 +546,9 @@ struct RowView: View {
                             JPButton(title: "重试", kind: .ghost, compact: true, action: onRetry)
                         }
                     } else {
-                        if hovering {
-                            Button(action: onReveal) {
-                                Image(systemName: "arrow.up.forward.app")
-                                    .font(.system(size: 11, weight: .semibold))
-                                    .foregroundStyle(T.ink3)
-                                    .frame(width: 20, height: 20)
-                                    .contentShape(Rectangle())
-                            }
-                            .buttonStyle(.plain)
-                            .help("在访达中显示")
-                        }
+                        // 常驻的两个出口：先让人看见证据，再让人决定。
+                        // 只在 hover 时出现等于没有——隐藏的出口会把用户逼回「脱密」。
+                        hstack_actions
                         // 「未检查」不是命中，脱不了密，别给一个点了只会报错的按钮
                         if level.isReportable {
                             JPButton(title: "脱密", kind: .ghost, enabled: !disabled,
@@ -581,6 +606,7 @@ struct MainView: View {
     var onSelectPage: () -> Void
     var onRetry: (String) -> Void
     var onToggleFilter: () -> Void
+    var onToggleSuppressed: () -> Void
     /// 离屏预览时不用 ScrollView（它渲染不出来）
     var preview = false
 
@@ -642,6 +668,13 @@ struct MainView: View {
                     .font(.jpC).foregroundStyle(T.ink3)
                 if model.needsFullDisk {
                     Text("（不完整）").font(.jpC).foregroundStyle(T.warn)
+                }
+                if model.onlySuppressed {
+                    Button("← 回到全部") { onToggleSuppressed() }
+                        .buttonStyle(.plain).font(.jpC).foregroundStyle(T.accent)
+                } else if model.suppressed > 0 {
+                    Button("已忽略 \(num(model.suppressed)) 条") { onToggleSuppressed() }
+                        .buttonStyle(.plain).font(.jpC).foregroundStyle(T.ink3)
                 }
                 Spacer(minLength: 8)
                 if model.pageCount > 1 {
@@ -845,6 +878,7 @@ final class WindowController {
     var onSelectPage: (() -> Void)?
     var onRetry: ((String) -> Void)?
     var onToggleFilter: (() -> Void)?
+    var onToggleSuppressed: (() -> Void)?
 
     init(model: Model, scanner: Scanner, store: Store) {
         self.model = model
@@ -875,7 +909,8 @@ final class WindowController {
                                 onPage: { [weak self] d in self?.onPage?(d) },
                                 onSelectPage: { [weak self] in self?.onSelectPage?() },
                                 onRetry: { [weak self] p in self?.onRetry?(p) },
-                                onToggleFilter: { [weak self] in self?.onToggleFilter?() })
+                                onToggleFilter: { [weak self] in self?.onToggleFilter?() },
+                                onToggleSuppressed: { [weak self] in self?.onToggleSuppressed?() })
             let w = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 600, height: 560),
                              styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
                              backing: .buffered, defer: false)
@@ -1066,16 +1101,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let scanning = self.scanner.scanning
             // 扫描中列表不重排：只更新计数与进度，避免用户正在看的行被换走
             let minLevel = self.model.onlySecrets ? SecretLevel.secret.rawValue : 0
-            let total = self.store.findingsCount(minLevel: minLevel)
+            let onlySupp = self.model.onlySuppressed
+            let total = self.store.findingsCount(minLevel: minLevel, suppressedOnly: onlySupp)
+            let supp = self.store.suppressedCount()
             let page = min(self.model.page, max(0, Int(ceil(Double(total) / Double(self.model.pageSize))) - 1))
             let rows = scanning ? self.model.rows
                                 : self.store.findings(limit: self.model.pageSize,
                                                       offset: page * self.model.pageSize,
-                                                      minLevel: minLevel)
+                                                      minLevel: minLevel, suppressedOnly: onlySupp)
             DispatchQueue.main.async {
                 self.model.page = page
                 self.model.totalHits = total
                 self.apply(c: c, rows: rows)
+                self.model.suppressed = supp
                 self.refreshing = false
             }
         }
@@ -1450,7 +1488,26 @@ if args.first == "--scan", let target = args.dropFirst().first {
         Confidential.inspectFileForCLI(url, ocr: ocr, into: &r)
         r.seconds = 0
     }
-    if args.contains("--json") { print(r.json) } else { print(r.text()) }
+    if args.contains("--json") { print(r.json) } else {
+        // 与窗口同一套「不报」规则：命令行不能比界面更吓人或更乐观
+        let rules = Store(path: Config.dbPath).suppressions().filter { $0.enabled }
+        let mutedIdx = Set(r.findings.indices.filter {
+            guard r.findings[$0].kind.rawValue == "密级标志" else { return false }
+            let abs = URL(fileURLWithPath: r.findings[$0].file, relativeTo: url).standardized.path
+            return suppressionMode(path: abs, level: r.findings[$0].level.rawValue,
+                                   ocr: r.findings[$0].viaOCR ? 1 : 0, rules: rules) > 0
+        })
+        let muted = mutedIdx.map { r.findings[$0] }
+        var kept = r
+        kept.findings = r.findings.enumerated().filter { !mutedIdx.contains($0.offset) }.map(\.element)
+        print(kept.text())
+        if !muted.isEmpty {
+            print("另有 \(muted.count) 条命中被「不报」规则压住（\(muted.prefix(3).map { ($0.file as NSString).lastPathComponent }.joined(separator: "、"))…）")
+            if args.contains("--show-suppressed") {
+                for f in muted { print("  已抑制 \(f.file)  level=\(f.level.rawValue) via_ocr=\(f.viaOCR ? 1 : 0)") }
+            }
+        }
+    }
     exit(0)
 }
 
@@ -1570,7 +1627,7 @@ if args.first == "--preview" {
                                     onSelectAll: { _ in }, onOpenTrash: {},
                                     onUndo: { _ in }, onStopProcessing: {},
                                     onPage: { _ in }, onSelectPage: {}, onRetry: { _ in },
-                                    onToggleFilter: {},
+                                    onToggleFilter: {}, onToggleSuppressed: {},
                                     preview: true)
                     .frame(width: 600, height: 560)
                     .environment(\.colorScheme, scheme)
